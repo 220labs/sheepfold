@@ -1,0 +1,30 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+
+.claude/settings.local.json
+
+# One worktree per Claude session (rule: git-workflow)
+.claude/worktrees/
+
+# Text only — binaries live elsewhere (rule: git-workflow)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.mp3
+*.wav
+*.mp4
+*.mov
+*.pdf
+*.zip
+*.db
+*.sqlite
+*.vsix
+out/
+build/

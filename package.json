@@ -1,0 +1,346 @@
+{
+  "name": "sheepfold",
+  "displayName": "sheepfold",
+  "description": "Your coding-agent sessions from spacesheep, in a VS Code sidebar, the ones that need you first.",
+  "version": "0.5.5",
+  "publisher": "220labs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/220labs/sheepfold.git"
+  },
+  "icon": "build/icon.png",
+  "galleryBanner": {
+    "color": "#E07A52",
+    "theme": "light"
+  },
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:sheepfold.sessions"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sheepfold",
+          "title": "sheepfold",
+          "icon": "media/sheepfold.svg"
+        }
+      ]
+    },
+    "views": {
+      "sheepfold": [
+        {
+          "id": "sheepfold.sessions",
+          "name": "Sessions"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "sheepfold.sessions",
+        "contents": "The fold is empty: no recent sessions. They wander in once the spacesheep CLI is signed in with session reporting on.\n[Refresh](command:sheepfold.refresh)",
+        "when": "sheepfold.status == 'empty'"
+      },
+      {
+        "view": "sheepfold.sessions",
+        "contents": "Could not count the sheep: the spacesheep CLI failed. The reason is shown above.\n[Refresh](command:sheepfold.refresh)\n[Open settings](command:workbench.action.openSettings?%5B%22sheepfold%22%5D)",
+        "when": "sheepfold.status == 'error'"
+      }
+    ],
+    "commands": [
+      {
+        "command": "sheepfold.refresh",
+        "title": "Refresh",
+        "category": "Sheepfold",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "sheepfold.open",
+        "title": "Open Session",
+        "category": "Sheepfold"
+      },
+      {
+        "command": "sheepfold.copySessionId",
+        "title": "Copy Session ID",
+        "category": "Sheepfold"
+      },
+      {
+        "command": "sheepfold.openOnClaudeAi",
+        "title": "Open on claude.ai",
+        "category": "Sheepfold"
+      },
+      {
+        "command": "sheepfold.revealFolder",
+        "title": "Reveal Folder",
+        "category": "Sheepfold"
+      },
+      {
+        "command": "sheepfold.openInNewWindow",
+        "title": "Open in New Window",
+        "category": "Sheepfold"
+      },
+      {
+        "command": "sheepfold.showOnSpacesheep",
+        "title": "Show on spacesheep",
+        "category": "Sheepfold"
+      },
+      {
+        "command": "sheepfold.toggleHosts",
+        "title": "Show Machine Names",
+        "category": "Sheepfold",
+        "icon": "$(server)"
+      },
+      {
+        "command": "sheepfold.toggleInactive",
+        "title": "Show All Inactive Sessions",
+        "category": "Sheepfold",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "sheepfold.toggleInactiveOff",
+        "title": "Cap Inactive Sessions",
+        "category": "Sheepfold",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "sheepfold.toggleMore",
+        "title": "Show More or Fewer",
+        "category": "Sheepfold"
+      },
+      {
+        "command": "sheepfold.openById",
+        "title": "Open Session by ID",
+        "category": "Sheepfold"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "sheepfold.refresh",
+          "when": "view == sheepfold.sessions",
+          "group": "navigation"
+        },
+        {
+          "command": "sheepfold.toggleHosts",
+          "when": "view == sheepfold.sessions",
+          "group": "navigation"
+        },
+        {
+          "command": "sheepfold.toggleInactive",
+          "when": "view == sheepfold.sessions && !sheepfold.showAllInactive",
+          "group": "navigation"
+        },
+        {
+          "command": "sheepfold.toggleInactiveOff",
+          "when": "view == sheepfold.sessions && sheepfold.showAllInactive",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "sheepfold.openInNewWindow",
+          "when": "view == sheepfold.sessions && viewItem =~ /nonEmpty/ && config.sheepfold.resume",
+          "group": "0_open"
+        },
+        {
+          "command": "sheepfold.showOnSpacesheep",
+          "when": "view == sheepfold.sessions && viewItem =~ /nonEmpty/",
+          "group": "0_open"
+        },
+        {
+          "command": "sheepfold.copySessionId",
+          "when": "view == sheepfold.sessions && viewItem =~ /session/",
+          "group": "1_copy"
+        },
+        {
+          "command": "sheepfold.openOnClaudeAi",
+          "when": "view == sheepfold.sessions && viewItem =~ /hasUrl/",
+          "group": "2_open"
+        },
+        {
+          "command": "sheepfold.revealFolder",
+          "when": "view == sheepfold.sessions && viewItem =~ /local/",
+          "group": "2_open"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "sheepfold.open",
+          "when": "false"
+        },
+        {
+          "command": "sheepfold.copySessionId",
+          "when": "false"
+        },
+        {
+          "command": "sheepfold.openOnClaudeAi",
+          "when": "false"
+        },
+        {
+          "command": "sheepfold.revealFolder",
+          "when": "false"
+        },
+        {
+          "command": "sheepfold.openInNewWindow",
+          "when": "false"
+        },
+        {
+          "command": "sheepfold.showOnSpacesheep",
+          "when": "false"
+        },
+        {
+          "command": "sheepfold.toggleMore",
+          "when": "false"
+        },
+        {
+          "command": "sheepfold.openById",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "sheepfold",
+      "properties": {
+        "sheepfold.cli": {
+          "type": "string",
+          "default": "spacesheep",
+          "description": "The spacesheep CLI to run. A bare name is looked up on PATH; use an absolute path when VS Code does not inherit your shell's PATH. A leading ~/ is expanded.",
+          "scope": "machine"
+        },
+        "sheepfold.refreshSeconds": {
+          "type": "number",
+          "default": 20,
+          "minimum": 5,
+          "description": "How often to refresh the list while the view is visible. While it is hidden the list still refreshes, at most once a minute, for the badge and the nudges."
+        },
+        "sheepfold.hideDoneAfterHours": {
+          "type": "number",
+          "default": 24,
+          "minimum": 0,
+          "description": "Hide finished sessions older than this many hours. 0 shows them all."
+        },
+        "sheepfold.localMachines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Machine names to treat as this machine, besides the host name (a trailing .local is ignored)."
+        },
+        "sheepfold.mirrorUrl": {
+          "type": "string",
+          "default": "http://localhost:4280",
+          "description": "Base URL of the local spacesheep mirror, used to open sessions from other machines."
+        },
+        "sheepfold.resume": {
+          "type": "boolean",
+          "default": false,
+          "description": "Offer to resume sessions from other folders (a new window) or other machines (Remote-SSH). Off: a click only navigates — Claude Code for a session in this workspace, spacesheep for every other — and nothing is opened or written elsewhere."
+        },
+        "sheepfold.remoteSessionPath": {
+          "type": "string",
+          "default": "/sessions/{source}/{id}",
+          "description": "Path appended to the mirror URL for \"Show on spacesheep\". Placeholders: {source}, {id}, {machine} (URL-encoded). The default opens the session's own page."
+        },
+        "sheepfold.remoteOpenIn": {
+          "type": "string",
+          "enum": [
+            "simpleBrowser",
+            "external"
+          ],
+          "default": "simpleBrowser",
+          "description": "Where a remote session opens: VS Code's Simple Browser, or your default browser."
+        },
+        "sheepfold.showEmpty": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show sessions that never got a prompt (no turns, no title, or a transcript with no user message). They have nothing to open."
+        },
+        "sheepfold.claudeConfigDir": {
+          "type": "string",
+          "default": "",
+          "description": "Claude Code's config directory, where session transcripts live (<dir>/projects/*/<id>.jsonl). Empty: the CLAUDE_CONFIG_DIR entry of the Claude Code setting claudeCode.environmentVariables, else the CLAUDE_CONFIG_DIR environment variable, else ~/.claude.",
+          "scope": "machine"
+        },
+        "sheepfold.remotes": {
+          "type": "object",
+          "default": {},
+          "description": "How to reach other machines over SSH, keyed by the machine name the session list shows. Example: { \"server\": { \"sshHost\": \"server\", \"home\": \"/home/me\" } }. sshHost is a Remote-SSH host; home is that machine's home directory, which a leading ~ in a session's folder expands to.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "sshHost": {
+                "type": "string",
+                "description": "Host as Remote-SSH names it (an ~/.ssh/config alias or user@host)."
+              },
+              "home": {
+                "type": "string",
+                "description": "Absolute home directory on that machine."
+              }
+            },
+            "required": [
+              "sshHost",
+              "home"
+            ]
+          },
+          "scope": "machine"
+        },
+        "sheepfold.inactivePerGroup": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "description": "Idle and finished sessions shown per project (and per dispatched node); sessions needing you or working are always shown. Click \"N more…\" to show the rest. 0 shows none until expanded."
+        },
+        "sheepfold.dispatchedTitlePattern": {
+          "type": "string",
+          "default": "\\s·\\s\\S+$",
+          "description": "Regular expression for titles of non-interactive (dispatched) sessions, such as \"repo: topic · host\". A session whose transcript says it ran through the SDK CLI is dispatched whatever its title. Empty turns the title test off."
+        },
+        "sheepfold.nudges": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a status-bar nudge for 15 seconds when a session starts needing you or finishes. A click goes to it."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "node --test out/test/*.test.js",
+    "package": "node scripts/render_icon.js && vsce package --no-dependencies",
+    "check": "tsc -p . && node --test out/test/*.test.js && node scripts/render_icon.js && vsce package --no-dependencies",
+    "icons": "python3 scripts/build_icons.py",
+    "icon": "node scripts/render_icon.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "~1.90.0",
+    "@vscode/vsce": "^4.0.0",
+    "typescript": "^7.0.2"
+  },
+  "keywords": [
+    "claude code",
+    "coding agents",
+    "sessions",
+    "spacesheep",
+    "sidebar"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Sheepfold runs the spacesheep CLI named in its settings."
+    }
+  }
+}
