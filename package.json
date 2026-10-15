@@ -2,7 +2,7 @@
   "name": "sheepfold",
   "displayName": "sheepfold",
   "description": "Your coding-agent sessions from spacesheep, in a VS Code sidebar, the ones that need you first.",
-  "version": "0.5.5",
+  "version": "0.6.0",
   "publisher": "220labs",
   "license": "MIT",
   "repository": {
@@ -237,12 +237,25 @@
             "type": "string"
           },
           "default": [],
-          "description": "Machine names to treat as this machine, besides the host name (a trailing .local is ignored)."
+          "description": "Machine names to treat as this machine, besides the host name and the name the spacesheep CLI reports (a trailing .local, .lan or .home is ignored)."
+        },
+        "sheepfold.openIn": {
+          "type": "string",
+          "enum": [
+            "editor",
+            "browser"
+          ],
+          "enumDescriptions": [
+            "A VS Code tab (Simple Browser), through the spacesheep mirror (`spacesheep mirror on`, CLI 1.27 or later) while it runs; your browser otherwise.",
+            "Your default browser."
+          ],
+          "default": "editor",
+          "description": "Where spacesheep pages open: a session's page, and the pages you click through to from it."
         },
         "sheepfold.mirrorUrl": {
           "type": "string",
-          "default": "http://localhost:4280",
-          "description": "Base URL of the local spacesheep mirror, used to open sessions from other machines."
+          "default": "",
+          "description": "Base URL of the spacesheep mirror. Empty (the default): ask the CLI where it runs (`spacesheep mirror status`)."
         },
         "sheepfold.resume": {
           "type": "boolean",
@@ -261,7 +274,8 @@
             "external"
           ],
           "default": "simpleBrowser",
-          "description": "Where a remote session opens: VS Code's Simple Browser, or your default browser."
+          "description": "Where a remote session opens: VS Code's Simple Browser, or your default browser.",
+          "markdownDeprecationMessage": "Use `#sheepfold.openIn#`. `external` still means the browser while `#sheepfold.openIn#` is unset."
         },
         "sheepfold.showEmpty": {
           "type": "boolean",
@@ -305,8 +319,8 @@
         },
         "sheepfold.dispatchedTitlePattern": {
           "type": "string",
-          "default": "\\s·\\s\\S+$",
-          "description": "Regular expression for titles of non-interactive (dispatched) sessions, such as \"repo: topic · host\". A session whose transcript says it ran through the SDK CLI is dispatched whatever its title. Empty turns the title test off."
+          "default": "",
+          "description": "Regular expression for titles of non-interactive (dispatched) sessions, if the tool that starts them names them in a pattern; for titles like \"repo: topic · host\", \\s·\\s\\S+$. A session whose transcript says it ran through the SDK CLI is dispatched whatever its title. Empty (the default): the title is not tested."
         },
         "sheepfold.nudges": {
           "type": "boolean",

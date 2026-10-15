@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import {
   DEFAULT_DISPATCHED_PATTERN,
+  EXAMPLE_DISPATCHED_PATTERN,
   ClassifyContext,
   buildBucket,
   compileDispatchedPattern,
@@ -28,7 +29,10 @@ import {
   remotePath,
   repoRoot,
   resolveConfigDir,
+  resumeWithRetry,
+  samePending,
   sshFolderUri,
+  sameFolder,
   expandHome,
   fallbackSessionUrl,
   firstLine,
@@ -36,6 +40,9 @@ import {
   iconState,
   isInsideFolders,
   isLocal,
+  mirrorFromStatus,
+  normPath,
+  resolveOpenIn,
   mirrorSessionUrl,
   parseSessions,
   projectKey,
@@ -469,18 +476,41 @@ test('findRemote matches a machine name loosely and ignores malformed entries', 
   assert.equal(findRemote(undefined, 'server'), null);
 });
 
-test('sshFolderUri builds the vscode-remote URI from home and cwd', () => {
+test('sshFolderUri gives the vscode-remote URI\'s parts from home and cwd', () => {
   const host = { sshHost: 'srv', home: '/home/dev/' };
   assert.deepEqual(sshFolderUri(host, '~/projects/app'), {
-    uri: 'vscode-remote://ssh-remote+srv/home/dev/projects/app',
+    scheme: 'vscode-remote',
+    authority: 'ssh-remote+srv',
     path: '/home/dev/projects/app',
   });
-  assert.equal(sshFolderUri(host, '/srv/data').uri, 'vscode-remote://ssh-remote+srv/srv/data');
+  assert.equal(sshFolderUri(host, '/srv/data').path, '/srv/data');
   assert.equal(sshFolderUri(host, '~').path, '/home/dev');
   assert.equal(sshFolderUri(host, null).path, '/home/dev');
   assert.equal(remotePath('/home/dev', 'rel/x'), '/home/dev/rel/x');
   // a removed worktree cannot be known remotely: the cwd is used as is
   assert.equal(sshFolderUri(host, '~/p/.claude/worktrees/x').path, '/home/dev/p/.claude/worktrees/x');
+});
+
+test('sshFolderUri keeps #, ? and % in the path, for Uri.from to encode', () => {
+  // Built as one string, `#b` would become a fragment, `?c` a query and `%41` an `A` under
+  // Uri.parse; as parts, the path is the folder's own name.
+  const host = { sshHost: 'user@srv', home: '/home/dev' };
+  const parts = sshFolderUri(host, '~/a#b/c?d/e%41 f');
+  assert.equal(parts.path, '/home/dev/a#b/c?d/e%41 f');
+  assert.equal(parts.authority, 'ssh-remote+user@srv');
+  // an authority needs a path from the root (Uri.from throws otherwise)
+  assert.equal(sshFolderUri({ sshHost: 'srv', home: 'home/dev' }, '~/x').path, '/home/dev/x');
+});
+
+test('classify hands the transcript lookup the session\'s cwd, home expanded', () => {
+  const seen: Array<[string, string | null]> = [];
+  const look = (id: string, cwd: string | null) => (seen.push([id, cwd]), WITH_MSG);
+  classify(mk({ sessionId: 's1', cwd: '~/projects/app' }), ctx({ transcript: look }));
+  classify(mk({ sessionId: 's2', cwd: null }), ctx({ transcript: look }));
+  assert.deepEqual(seen, [
+    ['s1', '/home/user/projects/app'],
+    ['s2', null],
+  ]);
 });
 
 // ---- v0.2: pending open -----------------------------------------------------------------------
@@ -495,6 +525,60 @@ test('pendingMatches: age under two minutes and a folder of this window', () => 
   assert.equal(pendingMatches({ ...p, folder: '/' }, NOW, ['/']), true);
 });
 
+test('samePending: same session, moment and folder only', () => {
+  const p = { sessionId: 'id', folder: '/w', at: NOW };
+  assert.equal(samePending({ ...p }, p), true);
+  assert.equal(samePending({ ...p, at: NOW + 1 }, p), false, 'a newer click for the same session');
+  assert.equal(samePending({ ...p, sessionId: 'other' }, p), false);
+  assert.equal(samePending(undefined, p), false);
+  assert.equal(samePending(null, p), false);
+});
+
+// A scripted Claude Code: which calls `resumeWithRetry` makes, in order.
+function steps(o: { activate?: () => Promise<unknown>; registeredAfter?: number; runFails?: number }) {
+  const calls: string[] = [];
+  let polls = 0;
+  let runs = 0;
+  return {
+    calls,
+    steps: {
+      activate: async () => {
+        calls.push('activate');
+        return o.activate?.();
+      },
+      registered: async () => {
+        calls.push('registered');
+        return ++polls > (o.registeredAfter ?? 0);
+      },
+      run: async () => {
+        calls.push('run');
+        if (++runs <= (o.runFails ?? 0)) throw new Error('not ready');
+      },
+      sleep: async () => {
+        calls.push('sleep');
+      },
+    },
+  };
+}
+
+test('resumeWithRetry activates Claude Code first, then runs its command once registered', async () => {
+  const a = steps({ registeredAfter: 2 });
+  assert.equal(await resumeWithRetry(a.steps), true);
+  assert.deepEqual(a.calls, ['activate', 'registered', 'sleep', 'registered', 'sleep', 'registered', 'run']);
+  // a command that throws while the extension settles is retried
+  const b = steps({ runFails: 1 });
+  assert.equal(await resumeWithRetry(b.steps), true);
+  assert.deepEqual(b.calls, ['activate', 'registered', 'run', 'sleep', 'registered', 'run']);
+});
+
+test('resumeWithRetry: a failed activation still polls, and gives up with false, never a throw', async () => {
+  const a = steps({ activate: () => Promise.reject(new Error('no such extension')), registeredAfter: 1 });
+  assert.equal(await resumeWithRetry(a.steps), true);
+  const never = steps({ registeredAfter: 99 });
+  assert.equal(await resumeWithRetry(never.steps, 3), false);
+  assert.deepEqual(never.calls, ['activate', 'registered', 'sleep', 'registered', 'sleep', 'registered']);
+});
+
 test('parsePending rejects malformed values', () => {
   assert.equal(parsePending(null), null);
   assert.equal(parsePending({ sessionId: 'a', folder: '/f' }), null);
@@ -506,7 +590,27 @@ test('decidePending: fires with a failing CLI, because it never looks at the CLI
   assert.throws(() => parseSessions('spacesheep: command not found'));
   const stored = { sessionId: 'id', folder: '/srv/work/app', at: NOW };
   const d = decidePending(stored, NOW + 5_000, ['/srv/work/app']);
-  assert.deepEqual(d, { run: stored, clear: true });
+  assert.deepEqual(d, { run: stored, clear: false }); // removed only once the session opened
+});
+
+test('decidePending: a taken hand-over is left to its window; any folder case matches', () => {
+  const stored = { sessionId: 'id', folder: 'C:\\Work\\App', at: NOW };
+  assert.equal(decidePending(stored, NOW + 1000, ['c:\\work\\app'])?.run?.sessionId, 'id');
+  assert.equal(decidePending(stored, NOW + 1000, ['/c:/work/app/'])?.run, null, 'a URI path is not an fsPath');
+  const taken = { ...stored, takenAt: NOW + 1000 };
+  assert.deepEqual(decidePending(taken, NOW + 2000, ['c:\\work\\app']), { run: null, clear: false });
+  // a window that took it and went quiet frees it after the hold
+  assert.equal(decidePending(taken, NOW + 1000 + 46_000, ['c:\\work\\app'])?.run?.sessionId, 'id');
+  assert.deepEqual(parsePending(taken), taken);
+});
+
+test('sameFolder: a drive letter of either case, a trailing slash, the host without case', () => {
+  const f = (path: string, authority = '') => ({ scheme: 'file', authority, path });
+  assert.equal(sameFolder(f('/C:/work/app'), f('/c:/work/app/')), true);
+  assert.equal(sameFolder(f('/srv/App'), f('/srv/app')), false);
+  assert.equal(sameFolder(f('/work/App'), f('/work/app'), true), true);
+  assert.equal(sameFolder(f('/srv/app', 'ssh-remote+Box'), f('/srv/app', 'ssh-remote+box')), true);
+  assert.equal(sameFolder(f('/srv/app'), { scheme: 'vscode-remote', authority: '', path: '/srv/app' }), false);
 });
 
 test('decidePending: other windows leave it, stale and malformed values are cleared', () => {
@@ -551,7 +655,8 @@ test('machineName and the host in the description', () => {
 });
 
 test('isDispatched: sdk-cli entrypoint or a title matching the pattern', () => {
-  const pat = compileDispatchedPattern(DEFAULT_DISPATCHED_PATTERN);
+  assert.equal(compileDispatchedPattern(DEFAULT_DISPATCHED_PATTERN), null, 'off by default');
+  const pat = compileDispatchedPattern(EXAMPLE_DISPATCHED_PATTERN);
   assert.ok(pat);
   assert.equal(isDispatched('sdk-cli', 'plain title', pat), true);
   assert.equal(isDispatched('cli', 'plain title', pat), false);
@@ -565,7 +670,7 @@ test('isDispatched: sdk-cli entrypoint or a title matching the pattern', () => {
 });
 
 test('classify marks dispatched rows: transcript entrypoint locally, title only for remote rows', () => {
-  const dispatchedPattern = compileDispatchedPattern(DEFAULT_DISPATCHED_PATTERN);
+  const dispatchedPattern = compileDispatchedPattern(EXAMPLE_DISPATCHED_PATTERN);
   const sdk: TranscriptInfo = { ...WITH_MSG, entrypoint: 'sdk-cli' };
   assert.equal(classify(mk(), ctx({ transcript: () => sdk, dispatchedPattern })).dispatched, true);
   assert.equal(classify(mk(), ctx({ transcript: () => ({ ...WITH_MSG, entrypoint: 'cli' }), dispatchedPattern })).dispatched, false);
@@ -574,6 +679,52 @@ test('classify marks dispatched rows: transcript entrypoint locally, title only 
   const remote = ctx({ local: false, transcript: () => sdk, dispatchedPattern });
   assert.equal(classify(mk({ machine: 'server' }), remote).dispatched, false);
   assert.equal(classify(mk({ machine: 'server', title: 'app: job · box' }), remote).dispatched, true);
+});
+
+test("Windows paths: backslashes and the drive letter's case do not change what is inside what", () => {
+  const home = 'C:\\Users\\me';
+  assert.equal(normPath('C:\\Users\\me\\app\\'), 'c:/users/me/app');
+  assert.equal(normPath('/home/me/App/'), '/home/me/App', 'POSIX paths keep their case');
+  assert.equal(normPath('/'), '/');
+  assert.equal(isInsideFolders('C:\\Users\\me\\app\\.claude\\worktrees\\fix', ['c:\\Users\\me\\app'], home), true);
+  assert.equal(isInsideFolders('~\\app\\sub', ['c:\\users\\me\\app'], home), true);
+  assert.equal(isInsideFolders('C:\\Users\\me\\apple', ['c:\\Users\\me\\app'], home), false);
+  assert.equal(projectKey({ repo: null, cwd: 'C:\\Users\\me\\projects\\app\\.claude\\worktrees\\fix' }), 'app');
+  assert.equal(repoRoot('C:\\Users\\me\\app\\.claude\\worktrees\\fix\\src'), 'C:\\Users\\me\\app', 'its own case: a folder to open');
+  const s = mk({ cwd: 'C:\\Users\\me\\app\\.claude\\worktrees\\fix' });
+  const c = classify(s, ctx({ home, folders: ['c:\\Users\\me\\app'], dirExists: () => true }));
+  assert.equal(c.kind, 'here');
+  assert.equal(c.folder, 'C:\\Users\\me\\app\\.claude\\worktrees\\fix', 'opened in its own case');
+});
+
+test('machine names: the CLI trims .local, .lan and .home, and may report a name of its own', () => {
+  assert.equal(machineName('box.lan'), 'box');
+  assert.equal(machineName('box.home'), 'box');
+  assert.equal(machineName('Box.local'), 'Box');
+  assert.equal(machineName('box.lan', 'studio'), 'studio');
+  assert.equal(isLocal('box', 'box.lan', []), true);
+  assert.equal(isLocal('studio', 'box.lan', [], 'studio'), true);
+  assert.equal(isLocal('studio', 'box.lan', [], null), false);
+});
+
+test('mirrorFromStatus: a running mirror of this site, at the port it reports', () => {
+  const site = 'https://site.example';
+  assert.equal(mirrorFromStatus('{"pid":1,"port":4281,"site":"https://site.example"}', site), 'http://localhost:4281');
+  assert.equal(mirrorFromStatus('{"pid":1,"port":4281,"site":"https://site.example/"}', site), 'http://localhost:4281');
+  assert.equal(mirrorFromStatus('{"running":false}', site), null);
+  assert.equal(mirrorFromStatus('{"pid":1,"port":4281,"site":"http://localhost:8787"}', site), null, 'a mirror of a dev server');
+  assert.equal(mirrorFromStatus('{"pid":1,"site":"https://site.example"}', site), null, 'no port');
+  assert.equal(mirrorFromStatus('{"pid":1,"port":"4281","site":"https://site.example"}', site), null);
+  assert.equal(mirrorFromStatus('Unknown command: mirror', site), null, 'a CLI before 1.27');
+  assert.equal(mirrorFromStatus('null', site), null);
+});
+
+test('resolveOpenIn: openIn wins once set; the deprecated remoteOpenIn external only while it is unset', () => {
+  assert.equal(resolveOpenIn({ explicit: undefined, effective: 'editor' }, undefined), 'editor');
+  assert.equal(resolveOpenIn({ explicit: undefined, effective: 'editor' }, 'external'), 'browser');
+  assert.equal(resolveOpenIn({ explicit: 'editor', effective: 'editor' }, 'external'), 'editor');
+  assert.equal(resolveOpenIn({ explicit: 'browser', effective: 'browser' }, 'simpleBrowser'), 'browser');
+  assert.equal(resolveOpenIn({ explicit: 'nonsense', effective: 'nonsense' }, undefined), 'editor');
 });
 
 test('isActive respects stale', () => {

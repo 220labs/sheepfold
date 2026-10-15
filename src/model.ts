@@ -79,6 +79,8 @@ export interface ListOptions {
 export interface RemoteOptions {
   mirrorUrl: string;
   remoteSessionPath: string;
+  /** The spacesheep web app; FALLBACK_BASE unless the CLI is pointed elsewhere. */
+  siteOrigin?: string | null;
 }
 
 export const STATE_ORDER: readonly State[] = ['needs_you', 'working', 'idle', 'done'];
@@ -142,7 +144,7 @@ export function parseSessions(text: string): { sessions: Session[]; now: number 
 }
 
 function lastSegment(path: string): string {
-  const parts = path.split('/').filter((p) => p !== '');
+  const parts = path.split(/[\\/]/).filter((p) => p !== '');
   return parts.length ? parts[parts.length - 1] : '';
 }
 
@@ -153,7 +155,7 @@ export function projectKey(s: Pick<Session, 'repo' | 'cwd'>): string {
     if (seg) return seg;
   }
   if (s.cwd) {
-    const base = s.cwd.replace(/\/+$/, '').replace(/\/\.claude\/worktrees\/[^/]+(\/.*)?$/, '');
+    const base = s.cwd.replace(/\\/g, '/').replace(/\/+$/, '').replace(/\/\.claude\/worktrees\/[^/]+(\/.*)?$/, '');
     const seg = lastSegment(base);
     if (seg) return seg;
   }
@@ -444,8 +446,14 @@ export function nudgeText(n: Nudge, label: (s: Session) => string): string {
 // ---------------------------------------------------------------------------------------------
 // Dispatched (non-interactive) sessions, and machine names.
 
-/** Default for `sheepfold.dispatchedTitlePattern`: titles like "repo: topic · host". */
-export const DEFAULT_DISPATCHED_PATTERN = '\\s·\\s\\S+$';
+/**
+ * Default for `sheepfold.dispatchedTitlePattern`: off. Titles are the user's own, so no
+ * convention can be assumed; the transcript's `sdk-cli` entrypoint marks dispatched rows anyway.
+ */
+export const DEFAULT_DISPATCHED_PATTERN = '';
+
+/** The README's example: titles like "repo: topic · host", as one launcher names its runs. */
+export const EXAMPLE_DISPATCHED_PATTERN = '\\s·\\s\\S+$';
 
 /** A user-given regex source, or null when it is empty or invalid. */
 export function compileDispatchedPattern(source: string | null | undefined): RegExp | null {
@@ -466,9 +474,12 @@ export function isDispatched(entrypoint: string | null, title: string | null, pa
   return Boolean(pattern && title && pattern.test(title));
 }
 
-/** This machine's name as shown (a `.local` suffix removed). */
-export function machineName(hostname: string): string {
-  return hostname.replace(/\.local$/i, '');
+/** The suffixes the spacesheep CLI drops from a hostname when it names the machine. */
+const HOST_SUFFIX = /\.(local|lan|home)$/i;
+
+/** This machine's name as shown: the name the CLI reports under, else the hostname as it trims it. */
+export function machineName(hostname: string, cliMachine?: string | null): string {
+  return cliMachine || hostname.replace(HOST_SUFFIX, '');
 }
 
 /** One line, whitespace collapsed, at most `max` characters. */
@@ -510,7 +521,7 @@ export function relativeTime(lastAt: number, now: number): string {
 }
 
 function stripLocalSuffix(name: string): string {
-  return name.replace(/\.local$/i, '').toLowerCase();
+  return name.replace(HOST_SUFFIX, '').toLowerCase();
 }
 
 /**
@@ -518,10 +529,16 @@ function stripLocalSuffix(name: string): string {
  * listed in `localMachines`. A session that names no machine cannot be told apart, so it counts
  * as local: the Claude Code extension is the only opener that can try it.
  */
-export function isLocal(machine: string | null, hostname: string, localMachines: readonly string[]): boolean {
+export function isLocal(
+  machine: string | null,
+  hostname: string,
+  localMachines: readonly string[],
+  cliMachine?: string | null,
+): boolean {
   if (!machine) return true;
   const m = stripLocalSuffix(machine);
   if (m === stripLocalSuffix(hostname)) return true;
+  if (cliMachine && m === stripLocalSuffix(cliMachine)) return true;
   return localMachines.some((l) => stripLocalSuffix(l) === m);
 }
 
@@ -532,13 +549,43 @@ export function iconState(s: Pick<Session, 'state' | 'stale'>): State {
 
 export function expandHome(path: string, home: string): string {
   if (path === '~') return home;
-  if (path.startsWith('~/')) return home.replace(/\/+$/, '') + path.slice(1);
+  if (path.startsWith('~/') || path.startsWith('~\\')) return home.replace(/[\\/]+$/, '') + path.slice(1);
   return path;
+}
+
+/**
+ * A path for comparing: forward slashes, no trailing slash, and a Windows drive path in lower
+ * case (its file system ignores case, and VS Code and Claude Code disagree on the drive letter's).
+ */
+export function normPath(p: string): string {
+  const s = p.replace(/\\/g, '/').replace(/(.)\/+$/, '$1');
+  return /^[a-zA-Z]:(\/|$)/.test(s) ? s.toLowerCase() : s;
+}
+
+/** A folder URI as parts: what `vscode.Uri` carries, without importing vscode. */
+export interface FolderParts {
+  scheme: string;
+  authority: string;
+  path: string;
+}
+
+/**
+ * Whether two folder URIs name the same folder: scheme exact, authority without case, path
+ * through `normPath` (a URI path spells a Windows drive as `/C:/x` or `/c:/x`), and without case
+ * at all when `ignoreCase` (as VS Code matches a folder to its window: always, but for local
+ * files on Linux).
+ */
+export function sameFolder(a: FolderParts, b: FolderParts, ignoreCase = false): boolean {
+  const path = (p: string) => {
+    const n = normPath(p.replace(/^\/([a-zA-Z]:)/, '$1'));
+    return ignoreCase ? n.toLowerCase() : n;
+  };
+  return a.scheme === b.scheme && a.authority.toLowerCase() === b.authority.toLowerCase() && path(a.path) === path(b.path);
 }
 
 /** Whether `cwd` is one of the workspace folders or inside one. */
 export function isInsideFolders(cwd: string, folders: readonly string[], home: string): boolean {
-  const norm = (p: string) => expandHome(p, home).replace(/\/+$/, '');
+  const norm = (p: string) => normPath(expandHome(p, home));
   const c = norm(cwd);
   return folders.some((f) => {
     const n = norm(f);
@@ -565,9 +612,35 @@ export function mirrorSessionUrl(s: Pick<Session, 'source' | 'sessionId' | 'mach
   return joinUrl(o.mirrorUrl, fill(o.remoteSessionPath, s));
 }
 
-/** The same path on spacesheep.dev, used when the mirror is not running. */
+/** The same path on the spacesheep site itself. */
 export function fallbackSessionUrl(s: Pick<Session, 'source' | 'sessionId' | 'machine'>, o: RemoteOptions): string {
-  return joinUrl(FALLBACK_BASE, fill(o.remoteSessionPath, s));
+  return joinUrl(o.siteOrigin || FALLBACK_BASE, fill(o.remoteSessionPath, s));
+}
+
+/**
+ * The mirror's base URL from `spacesheep mirror status --json`: `{ pid, port, site, ... }` while
+ * one runs, `{ running: false }` when none does. A mirror of another site (a dev server) does
+ * not count, and the port is read, never assumed. Null for anything else.
+ */
+export function mirrorFromStatus(text: string, site: string): string | null {
+  try {
+    const s = JSON.parse(text) as { port?: unknown; site?: unknown; running?: unknown } | null;
+    if (!s || s.running === false) return null;
+    if (typeof s.site !== 'string' || s.site.replace(/\/+$/, '') !== site.replace(/\/+$/, '')) return null;
+    const port = s.port;
+    return typeof port === 'number' && Number.isInteger(port) && port > 0 && port < 65536 ? `http://localhost:${port}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `sheepfold.openIn` as it applies: `browser` or `editor`, and while openIn is set nowhere, the
+ * deprecated `remoteOpenIn: external` still means the browser.
+ */
+export function resolveOpenIn(openIn: { explicit: unknown; effective: unknown }, remoteOpenIn: unknown): 'editor' | 'browser' {
+  if (openIn.explicit === undefined && remoteOpenIn === 'external') return 'browser';
+  return openIn.effective === 'browser' ? 'browser' : 'editor';
 }
 
 /** The Claude Code extension's URI-handler form of "open this session". */
@@ -656,7 +729,8 @@ export interface ClassifyContext {
   /** Open workspace folders (local paths). */
   folders: readonly string[];
   home: string;
-  transcript: (sessionId: string) => TranscriptInfo;
+  /** The transcript of a session; `cwd` (home expanded, or null) lets it look in one place first. */
+  transcript: (sessionId: string, cwd: string | null) => TranscriptInfo;
   dirExists: (path: string) => boolean;
   /** Compiled `sheepfold.dispatchedTitlePattern`. */
   dispatchedPattern?: RegExp | null;
@@ -664,7 +738,8 @@ export interface ClassifyContext {
 
 /** `<root>/.claude/worktrees/<x>[/...]` → `<root>`; any other path unchanged (no trailing slash). */
 export function repoRoot(path: string): string {
-  return path.replace(/\/+$/, '').replace(/\/\.claude\/worktrees\/[^/]+(\/.*)?$/, '');
+  // Either separator, the path's own case: the result is a folder to open, not only a key.
+  return path.replace(/(.)[\\/]+$/, '$1').replace(/[\\/]\.claude[\\/]worktrees[\\/][^\\/]+([\\/].*)?$/, '');
 }
 
 const NO_TRANSCRIPT: TranscriptInfo = { found: false, hasUser: false, firstUser: null };
@@ -697,7 +772,7 @@ function classifyOpen(s: Session, ctx: ClassifyContext, seenEntrypoint: (e: stri
   if (s.turns === 0 && !named) return result('empty');
   if (!ctx.local) return result('remote');
 
-  const t = ctx.transcript(s.sessionId) ?? NO_TRANSCRIPT;
+  const t = ctx.transcript(s.sessionId, s.cwd ? expandHome(s.cwd, ctx.home) : null) ?? NO_TRANSCRIPT;
   seenEntrypoint(t.entrypoint ?? null);
   if (!t.found) {
     return named || (s.turns ?? 0) > 0 ? result('noTranscript') : result('empty');
@@ -706,9 +781,11 @@ function classifyOpen(s: Session, ctx: ClassifyContext, seenEntrypoint: (e: stri
   const firstUser = t.firstUser;
 
   if (!s.cwd) return result('here', { firstUser });
-  const cwd = expandHome(s.cwd, ctx.home).replace(/\/+$/, '');
+  // `cwd` keeps its own case and separators (it is opened); `key` is for comparing.
+  const cwd = expandHome(s.cwd, ctx.home).replace(/(.)[\\/]+$/, '$1');
+  const key = normPath(cwd);
   const inside = isInsideFolders(cwd, ctx.folders, ctx.home);
-  const exactFolder = ctx.folders.some((f) => expandHome(f, ctx.home).replace(/\/+$/, '') === cwd);
+  const exactFolder = ctx.folders.some((f) => normPath(expandHome(f, ctx.home)) === key);
   // Claude Code only probes worktrees git still lists, so a removed one opens blank: `here`
   // needs the cwd to exist (an open workspace folder itself is taken as existing).
   if (exactFolder) return result('here', { firstUser, folder: cwd });
@@ -716,14 +793,14 @@ function classifyOpen(s: Session, ctx: ClassifyContext, seenEntrypoint: (e: stri
   if (inside) return result('noTranscript', { firstUser, cwdGone: true });
 
   const root = repoRoot(cwd);
-  if (root !== cwd && ctx.dirExists(root)) {
+  if (normPath(root) !== key && ctx.dirExists(root)) {
     return result('otherFolder', { firstUser, folder: root, cwdGone: true });
   }
   return result('noTranscript', { firstUser, cwdGone: true });
 }
 
 function goneLabel(s: Pick<Session, 'cwd'>): string {
-  return s.cwd && repoRoot(s.cwd) !== s.cwd.replace(/\/+$/, '') ? 'worktree removed' : 'folder removed';
+  return s.cwd && normPath(repoRoot(s.cwd)) !== normPath(s.cwd) ? 'worktree removed' : 'folder removed';
 }
 
 /** The hint after the time in a row's description. */
@@ -833,10 +910,16 @@ export function remotePath(home: string, cwd: string | null): string {
   return `${h}/${cwd}`;
 }
 
-/** `vscode-remote://ssh-remote+<host><path>` for a session's folder on another machine. */
-export function sshFolderUri(host: RemoteHost, cwd: string | null): { uri: string; path: string } {
-  const path = remotePath(host.home, cwd);
-  return { uri: `vscode-remote://ssh-remote+${host.sshHost}${path}`, path };
+/**
+ * The parts of `vscode-remote://ssh-remote+<host><path>` for a session's folder on another
+ * machine, for `vscode.Uri.from`: built from parts, a `#`, `?` or `%` in the path stays part of
+ * the path, where a string through `Uri.parse` would end it or decode it. A URI with an
+ * authority needs a path that starts with `/` (Uri.from throws otherwise), so a relative `home`
+ * gets one.
+ */
+export function sshFolderUri(host: RemoteHost, cwd: string | null): { scheme: 'vscode-remote'; authority: string; path: string } {
+  const p = remotePath(host.home, cwd);
+  return { scheme: 'vscode-remote', authority: `ssh-remote+${host.sshHost}`, path: p.startsWith('/') ? p : `/${p}` };
 }
 
 export interface PendingOpen {
@@ -845,9 +928,19 @@ export interface PendingOpen {
   folder: string;
   /** Unix ms when it was stored. */
   at: number;
+  /** Unix ms when a window took it; until it is done or fails, no other window runs it too. */
+  takenAt?: number;
 }
 
 export const PENDING_MAX_AGE_MS = 120_000;
+/** How long a taken hand-over is left to the window that took it (activation and polling: ~20 s). */
+export const PENDING_TAKEN_HOLD_MS = 45_000;
+/**
+ * How long an expired hand-over stays before any window clears it: the clicking window looks
+ * at `PENDING_MAX_AGE_MS + 1000` to say none took it, and a window focused in between must not
+ * delete the file first and silence that warning.
+ */
+export const PENDING_CLEAR_GRACE_MS = 5_000;
 
 export function parsePending(v: unknown): PendingOpen | null {
   const p = v as Partial<PendingOpen> | null;
@@ -855,7 +948,9 @@ export function parsePending(v: unknown): PendingOpen | null {
   if (typeof p.sessionId !== 'string' || !p.sessionId) return null;
   if (typeof p.folder !== 'string' || !p.folder) return null;
   if (typeof p.at !== 'number' || !Number.isFinite(p.at)) return null;
-  return { sessionId: p.sessionId, folder: p.folder, at: p.at };
+  const q: PendingOpen = { sessionId: p.sessionId, folder: p.folder, at: p.at };
+  if (typeof p.takenAt === 'number' && Number.isFinite(p.takenAt)) q.takenAt = p.takenAt;
+  return q;
 }
 
 function trimSlash(p: string): string {
@@ -870,14 +965,20 @@ function trimSlash(p: string): string {
 export function pendingMatches(p: PendingOpen, now: number, windowFolders: readonly string[]): boolean {
   const age = now - p.at;
   if (age < 0 || age >= PENDING_MAX_AGE_MS) return false;
-  const want = trimSlash(p.folder);
-  return windowFolders.some((f) => trimSlash(f) === want);
+  // Lowercased, because VS Code focuses the window for a folder whatever its case (a Windows
+  // drive letter, a case-insensitive disk); a hand-over its focus handler then missed would
+  // never fire. On Linux, where `/srv/App` and `/srv/app` are two windows, a focused `/srv/App`
+  // window could take one meant for `/srv/app`: rare, and the session still opens.
+  const key = (f: string) => trimSlash(normPath(f)).toLowerCase();
+  const want = key(p.folder);
+  return windowFolders.some((f) => key(f) === want);
 }
 
 export interface PendingDecision {
   /** The session to open in this window now, if any. */
   run: PendingOpen | null;
-  /** Whether the stored value should be removed (applied, expired or unreadable). */
+  /** Whether the stored value should be removed now (expired or unreadable). A value to run is
+   * kept: the window removes it once the session opened (`deletePendingIf`). */
   clear: boolean;
 }
 
@@ -892,6 +993,54 @@ export function decidePending(raw: unknown, now: number, windowFolders: readonly
   const p = parsePending(raw);
   if (!p) return { run: null, clear: true };
   const age = now - p.at;
-  if (age < 0 || age >= PENDING_MAX_AGE_MS) return { run: null, clear: true };
-  return pendingMatches(p, now, windowFolders) ? { run: p, clear: true } : { run: null, clear: false };
+  if (age < 0) return { run: null, clear: true };
+  if (age >= PENDING_MAX_AGE_MS) return { run: null, clear: age >= PENDING_MAX_AGE_MS + PENDING_CLEAR_GRACE_MS };
+  if (p.takenAt !== undefined && now - p.takenAt >= 0 && now - p.takenAt < PENDING_TAKEN_HOLD_MS) {
+    return { run: null, clear: false }; // another window is on it
+  }
+  return pendingMatches(p, now, windowFolders) ? { run: p, clear: false } : { run: null, clear: false };
+}
+
+/** Whether a stored value is still this pending open (same session, same moment). */
+export function samePending(raw: unknown, p: PendingOpen): boolean {
+  const q = parsePending(raw);
+  return q !== null && q.sessionId === p.sessionId && q.at === p.at && q.folder === p.folder;
+}
+
+/** The parts of the VS Code API `resumeWithRetry` drives, injected so it runs under `node --test`. */
+export interface ResumeSteps {
+  /** Start the Claude Code extension (`Extension.activate()`); throws or rejects when it can't. */
+  activate: () => Promise<unknown>;
+  /** Whether its open command is registered yet. */
+  registered: () => Promise<boolean>;
+  /** Run that command for the session; rejects when it fails. */
+  run: () => Promise<unknown>;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/**
+ * Resume a session handed over to this window: activate Claude Code first (waiting for its
+ * command alone never starts it: nothing else in a fresh window may), then run its open
+ * command, retrying while the command is not registered yet or fails. Resolves true once the
+ * command ran, false when every try failed; never throws, so the caller can say why.
+ */
+export async function resumeWithRetry(steps: ResumeSteps, tries = 10, delayMs = 1000): Promise<boolean> {
+  try {
+    await steps.activate();
+  } catch {
+    // not installed in this extension host, or its activation failed: the command may still
+    // come from another host, so poll for it anyway
+  }
+  for (let i = 0; i < tries; i++) {
+    try {
+      if (await steps.registered()) {
+        await steps.run();
+        return true;
+      }
+    } catch {
+      // not ready yet: try again
+    }
+    if (i < tries - 1) await steps.sleep(delayMs);
+  }
+  return false;
 }

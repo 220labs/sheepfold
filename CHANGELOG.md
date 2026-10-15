@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.6.0
+
+- spacesheep pages open in a VS Code tab through the CLI's mirror (`spacesheep mirror on`, CLI
+  1.27+), found by asking the CLI (`spacesheep mirror status`) instead of probing port 4280,
+  where anything that answered was taken for it. Without a mirror they open in the browser.
+  New setting `sheepfold.openIn`: `editor` (default) or `browser`; `sheepfold.remoteOpenIn` is
+  deprecated, and its `external` is still honoured. `sheepfold.mirrorUrl` is now an override,
+  empty by default.
+- Works beyond the author's setup:
+  - Windows: an npm-installed CLI (a `.cmd` shim) runs; paths with `\` and either drive-letter
+    case match the open folders, so worktree sessions open in Claude Code.
+  - This machine is the name the CLI reports it under (`connect`/`--machine`), and a host name
+    loses `.lan` and `.home` as well as `.local`, as the CLI does.
+  - A CLI pointed at another site (`SPACESHEEP_APP_ORIGIN`, `appOrigin`) points the pages there.
+  - `sheepfold.dispatchedTitlePattern` is empty by default; the README gives the old value as an
+    example.
+  - No Simple Browser (some VS Code builds): pages open in the browser instead of an error.
+- Resuming elsewhere (`sheepfold.resume`), from the review of 2026-10-10:
+  - A folder already open in another window resumes there: VS Code brings that window forward
+    and it takes the hand-over on focus. A folder open in this window resumes here.
+  - The new window starts Claude Code itself rather than waiting for it, keeps the hand-over
+    until the session has opened, and says so with "Try again" when it cannot.
+  - A local hand-over no window took is removed after two minutes, and the window you clicked
+    in says so.
+  - A remote folder with `#`, `?` or `%` in its path opens that folder.
+- Faster with many sessions: a transcript is looked for in its own project folder before every
+  folder is listed, a scan that found the first prompt is not redone as the session grows, and
+  only the first 200 characters of that prompt are kept.
+- A child link caught half-written by its launcher shows once complete, and a rewrite within the
+  same second is read again.
+- `npm run icon` shows Chrome's own error when no PNG comes back.
+
 ## 0.5.5
 
 - The list keeps refreshing while the view is hidden, at most once a minute, so the badge and
