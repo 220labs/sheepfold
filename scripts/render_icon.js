@@ -29,6 +29,15 @@ function chrome() {
   return found;
 }
 
+/**
+ * The last lines Chrome wrote to stderr, for an error message: on success it is noise (GPU and
+ * sandbox chatter), but when no PNG comes back it is the only account of why.
+ */
+function tail(text, lines = 15) {
+  const kept = text.trimEnd().split('\n').slice(-lines).join('\n');
+  return kept ? `Chrome's stderr, last lines:\n${kept}` : 'Chrome wrote nothing to stderr';
+}
+
 /** Width and height from a PNG's IHDR chunk, or null when the file is not a PNG. */
 function pngSize(file) {
   const b = fs.readFileSync(file);
@@ -56,6 +65,7 @@ img.onload = () => {
 img.src = 'data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}';
 </script></body></html>`,
   );
+  let stderr = '';
   const dom = await new Promise((resolve, reject) => {
     const proc = spawn(
       chrome(),
@@ -68,9 +78,13 @@ img.src = 'data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}';
         '--dump-dom',
         `file://${page}`,
       ],
-      { stdio: ['ignore', 'pipe', 'ignore'] },
+      { stdio: ['ignore', 'pipe', 'pipe'] },
     );
     let out = '';
+    // Read as it comes (an unread pipe can fill and stall Chrome); only the last 64 KB is kept.
+    proc.stderr.on('data', (d) => {
+      stderr = (stderr + d).slice(-64 * 1024);
+    });
     proc.stdout.on('data', (d) => {
       out += d;
       // In a sandboxed session Chrome prints the DOM and never exits: stop it once it has.
@@ -78,16 +92,17 @@ img.src = 'data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}';
     });
     const timer = setTimeout(() => {
       proc.kill();
-      reject(new Error('Chrome printed no DOM in 30 s'));
+      reject(new Error(`Chrome printed no DOM in 30 s\n${tail(stderr)}`));
     }, 30_000);
-    proc.on('exit', () => {
+    // 'close', not 'exit': only then have stdout and stderr been read to the end.
+    proc.on('close', () => {
       clearTimeout(timer);
       resolve(out);
     });
     proc.on('error', reject);
   });
   const m = /data:image\/png;base64,([A-Za-z0-9+/=]+)/.exec(dom);
-  if (!m) throw new Error('the page produced no PNG');
+  if (!m) throw new Error(`the page produced no PNG\n${tail(stderr)}`);
   fs.mkdirSync(path.dirname(OUT), { recursive: true });
   fs.writeFileSync(OUT, Buffer.from(m[1], 'base64'));
   const size = pngSize(OUT);

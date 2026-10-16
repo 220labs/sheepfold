@@ -4,7 +4,7 @@
 __pycache__/
 *.pyc
 .DS_Store
-node_modules/
+node_modules
 
 .claude/settings.local.json
 
