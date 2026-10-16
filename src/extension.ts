@@ -3,10 +3,15 @@ import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import {
+  offersSshResume,
   Classification,
   Group,
   MoreRow,
   PendingOpen,
+  PENDING_MAX_AGE_MS,
+  PENDING_TAKEN_HOLD_MS,
+  parsePending,
+  sameFolder,
   Nudge,
   Session,
   State,
@@ -21,7 +26,10 @@ import {
   escapeMarkdown,
   excludeEmpty,
   expandHome,
+  FALLBACK_BASE,
   fallbackSessionUrl,
+  mirrorFromStatus,
+  resolveOpenIn,
   findRemote,
   firstLine,
   groupLayout,
@@ -37,6 +45,8 @@ import {
   nudgeText,
   parseSessions,
   quietLine,
+  resumeWithRetry,
+  samePending,
   stateMap,
   tally,
   projectKey,
@@ -46,9 +56,23 @@ import {
   sshFolderUri,
   tooltipFields,
 } from './model';
-import { ChildLinks, TranscriptIndex, childLinksDir, deletePending, dirExists, readPending, writePending, writePendingOverSsh } from './local';
+import {
+  ChildLinks,
+  TranscriptIndex,
+  childLinksDir,
+  readCliSettings,
+  deletePending,
+  deletePendingIf,
+  dirExists,
+  readPending,
+  writePending,
+  writePendingOverSsh,
+} from './local';
 
 const CLAUDE_OPEN_COMMAND = 'claude-vscode.editor.open';
+// Its id as `vscode.extensions.getExtension` takes it (the manifest says `Anthropic`; ids
+// compare without case).
+const CLAUDE_EXTENSION_ID = 'anthropic.claude-code';
 
 type Node =
   | { kind: 'group'; group: Group }
@@ -64,8 +88,23 @@ function settings() {
   return vscode.workspace.getConfiguration('sheepfold');
 }
 
+// What the CLI's own config says (its machine name, its site); re-read at every refresh.
+let cliMachine: string | null = null;
+let siteOrigin: string = FALLBACK_BASE;
+
+function readCli(): void {
+  const c = readCliSettings(process.env, os.homedir());
+  cliMachine = c.machine;
+  siteOrigin = c.appOrigin ?? FALLBACK_BASE;
+}
+
 function localOptions() {
   return { hostname: os.hostname(), localMachines: settings().get<string[]>('localMachines', []) };
+}
+
+/** This host as the session list names it. */
+function thisMachine(): string {
+  return machineName(os.hostname(), cliMachine);
 }
 
 function claudeConfigDir(): string {
@@ -81,16 +120,23 @@ function workspacePaths(): string[] {
   return (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
 }
 
-function runCli(cli: string): Promise<string> {
+function runCli(cli: string, args: readonly string[] = ['sessions', 'list', '--limit', '100'], timeout = 20_000): Promise<string> {
+  const program = expandHome(cli, os.homedir());
+  // On Windows an npm-installed CLI is a .cmd shim, which Node runs only through a shell: one
+  // command line, the program quoted (an args array beside `shell` is deprecated, DEP0190). The
+  // arguments are fixed words, so the shell sees nothing a user typed but the quoted path.
+  const win = process.platform === 'win32';
+  const command = win ? [`"${program.replace(/"/g, '')}"`, ...args].join(' ') : program;
   return new Promise((resolve, reject) => {
     execFile(
-      expandHome(cli, os.homedir()),
-      ['sessions', 'list', '--limit', '100'],
-      { timeout: 20_000, maxBuffer: 32 * 1024 * 1024, windowsHide: true },
+      command,
+      win ? [] : [...args],
+      { timeout, maxBuffer: 32 * 1024 * 1024, windowsHide: true, shell: win },
       (err, stdout, stderr) => {
         if (err) {
           const code = (err as NodeJS.ErrnoException).code;
-          if (code === 'ENOENT') {
+          // Through cmd.exe a missing program is not ENOENT but its own message.
+          if (code === 'ENOENT' || (win && /is not recognized as an internal or external command/i.test(String(stderr)))) {
             reject(new Error(`spacesheep CLI not found (${cli}). Set sheepfold.cli to its full path.`));
           } else {
             reject(new Error(firstLine(String(stderr)) || err.message));
@@ -170,6 +216,7 @@ class SessionsProvider implements vscode.TreeDataProvider<Node> {
       const parsed = parseSessions(await runCli(settings().get<string>('cli', 'spacesheep')));
       this.now = parsed.now ?? Date.now();
       this.index.setConfigDir(claudeConfigDir());
+      readCli();
       const { hostname, localMachines } = localOptions();
       const home = os.homedir();
       const folders = workspacePaths();
@@ -183,10 +230,10 @@ class SessionsProvider implements vscode.TreeDataProvider<Node> {
         this.classes.set(
           s.sessionId,
           classify(s, {
-            local: isLocal(s.machine, hostname, localMachines),
+            local: isLocal(s.machine, hostname, localMachines, cliMachine),
             folders,
             home,
-            transcript: (id) => this.index.info(id),
+            transcript: (id, cwd) => this.index.info(id, cwd),
             dirExists,
             dispatchedPattern,
           }),
@@ -279,7 +326,7 @@ class SessionsProvider implements vscode.TreeDataProvider<Node> {
     const s = node.session;
     const c = this.classOf(s);
     const { hostname, localMachines } = localOptions();
-    const local = isLocal(s.machine, hostname, localMachines);
+    const local = isLocal(s.machine, hostname, localMachines, cliMachine);
     // A row that started other sessions holds them; open while any of them is active.
     const kids = node.group.children.get(s.sessionId) ?? [];
     const item = new vscode.TreeItem(
@@ -292,9 +339,9 @@ class SessionsProvider implements vscode.TreeDataProvider<Node> {
     );
     // A row with children carries its wanted expansion in its id, as the dispatched node does.
     item.id = kids.length === 0 ? `session:${s.sessionId}` : `session:${s.sessionId}:${kids.some(isActive) ? 'open' : 'shut'}`;
-    item.description = sessionDescription(s, this.now, local, c, this.showHosts ? machineName(s.machine ?? hostname) : null);
+    item.description = sessionDescription(s, this.now, local, c, this.showHosts ? (s.machine ? machineName(s.machine) : thisMachine()) : null);
     item.iconPath = iconFor(s);
-    item.tooltip = tooltipFor(s, c, machineName(hostname), kids.length);
+    item.tooltip = tooltipFor(s, c, thisMachine(), kids.length);
     item.contextValue = [
       'session',
       local ? 'local' : 'remote',
@@ -325,10 +372,10 @@ function remoteFor(s: Session) {
   return findRemote(settings().get<unknown>('remotes'), s.machine);
 }
 
-function tooltipFor(s: Session, c: Classification | undefined, thisMachine: string, started = 0): vscode.MarkdownString {
+function tooltipFor(s: Session, c: Classification | undefined, here: string, started = 0): vscode.MarkdownString {
   const md = new vscode.MarkdownString(undefined, false);
   md.appendMarkdown(`**${escapeMarkdown(sessionLabel(s, c?.firstUser))}**\n\n`);
-  for (const [label, value] of tooltipFields(s, thisMachine)) {
+  for (const [label, value] of tooltipFields(s, here)) {
     md.appendMarkdown(`${label}: ${escapeMarkdown(value)}  \n`);
   }
   if (started > 0) md.appendMarkdown(`Started: ${started === 1 ? '1 session' : `${started} sessions`}, nested below  \n`);
@@ -337,38 +384,136 @@ function tooltipFor(s: Session, c: Classification | undefined, thisMachine: stri
 }
 
 let noMirrorNoticeShown = false;
+// What a click decided and why: the Output panel's "Sheepfold" channel, also a file in VS Code's
+// logs, so a click that went to the browser can be explained without a debugger.
+let log: vscode.LogOutputChannel | undefined;
 
-async function probe(base: string): Promise<boolean> {
-  try {
-    await fetch(base, { signal: AbortSignal.timeout(1500) });
-    return true;
-  } catch {
-    return false;
+/**
+ * Where the spacesheep mirror runs: `sheepfold.mirrorUrl` when set, else what the CLI says
+ * (`spacesheep mirror status --json`, CLI 1.27+). Null when none runs, or the CLI has no mirror
+ * yet. Asking the CLI rather than probing a port: anything can answer on a port.
+ */
+// The last answer, kept two minutes: asking the CLI costs a process start (about 1.3 s seen from
+// VS Code), and a click should not wait for it every time. Warmed at activation.
+let mirrorCache: { base: string | null; at: number } | null = null;
+const MIRROR_TTL_MS = 120_000;
+
+async function mirrorBase(): Promise<string | null> {
+  const set = settings().get<string>('mirrorUrl', '').trim();
+  if (set) {
+    log?.info(`mirror: sheepfold.mirrorUrl ${set}`);
+    return set;
   }
+  // "None" is kept only 15 s, so a mirror just turned on is seen at the next click or so.
+  if (mirrorCache && Date.now() - mirrorCache.at < (mirrorCache.base ? MIRROR_TTL_MS : 15_000)) return mirrorCache.base;
+  const base = await askMirror();
+  mirrorCache = { base, at: Date.now() };
+  return base;
 }
 
-async function showOnSpacesheep(s: Session): Promise<void> {
+async function askMirror(): Promise<string | null> {
+  let out: string;
+  try {
+    out = await runCli(settings().get<string>('cli', 'spacesheep'), ['mirror', 'status', '--json'], 5_000);
+  } catch (e) {
+    log?.info(`mirror: none (\`spacesheep mirror status\` failed: ${e instanceof Error ? e.message : String(e)})`);
+    return null;
+  }
+  const base = mirrorFromStatus(out, siteOrigin);
+  log?.info(base ? `mirror: ${base}` : `mirror: none for ${siteOrigin} (status said ${out.replace(/\s+/g, ' ').trim().slice(0, 200)})`);
+  return base;
+}
+
+/** `sheepfold.openIn`; the old `remoteOpenIn: external` still means the browser if openIn is unset. */
+function openIn(): 'editor' | 'browser' {
   const cfg = settings();
-  const opts = {
-    mirrorUrl: cfg.get<string>('mirrorUrl', 'http://localhost:4280'),
-    remoteSessionPath: cfg.get<string>('remoteSessionPath', '/sessions/{source}/{id}'),
-  };
-  if (await probe(opts.mirrorUrl)) {
-    const url = mirrorSessionUrl(s, opts);
-    if (cfg.get<string>('remoteOpenIn', 'simpleBrowser') === 'external') {
-      await vscode.env.openExternal(vscode.Uri.parse(url));
-    } else {
-      await vscode.commands.executeCommand('simpleBrowser.show', url);
+  const set = cfg.inspect<string>('openIn');
+  return resolveOpenIn(
+    { explicit: set?.workspaceFolderValue ?? set?.workspaceValue ?? set?.globalValue, effective: cfg.get<string>('openIn', 'editor') },
+    cfg.get<string>('remoteOpenIn'),
+  );
+}
+
+/**
+ * A session's spacesheep page: in a VS Code tab through the mirror (spacesheep.dev refuses to
+ * be framed; the mirror serves it framable, signed in with the CLI's key), else the browser.
+ */
+async function showOnSpacesheep(s: Session): Promise<void> {
+  const opts = pageOptions();
+  if (openIn() === 'editor') {
+    const base = await mirrorBase();
+    if (base) {
+      try {
+        // In a Remote-SSH window the mirror runs on the remote host: forward its port.
+        // Forward only the base (Remote-SSH: the mirror runs on the remote host), then append the
+        // path as built: a Uri round trip would decode its escapes (`%2F` → `/`).
+        const forwarded = await vscode.env.asExternalUri(vscode.Uri.parse(base));
+        const origin = new URL(forwarded.toString(true)).origin;
+        // The mirror rewrites every link to its own port and refuses writes from another, so a
+        // forward that lands on a different local port would half-work: the browser instead.
+        if (new URL(origin).port !== new URL(base).port) {
+          log?.warn(`mirror forwarded to ${origin}, not its own port ${new URL(base).port}: the browser instead`);
+        } else {
+          const url = mirrorSessionUrl(s, { ...opts, mirrorUrl: origin });
+          log?.info(`open ${s.sessionId} in a tab: ${url}`);
+          await vscode.commands.executeCommand('simpleBrowser.show', url);
+          const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+          if (tab) tabSessions.set(tab, s);
+          updateTabContext();
+          return;
+        }
+      } catch (e) {
+        // no Simple Browser (some VS Code builds): the browser below
+        log?.warn(`tab failed, opening the browser: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } else if (!noMirrorNoticeShown) {
+      noMirrorNoticeShown = true;
+      void vscode.window.showInformationMessage(
+        'spacesheep pages open in a VS Code tab while `spacesheep mirror on` runs (spacesheep CLI 1.27 or later). Until then, in your browser.',
+      );
     }
-    return;
   }
-  await vscode.env.openExternal(vscode.Uri.parse(fallbackSessionUrl(s, opts)));
-  if (!noMirrorNoticeShown) {
-    noMirrorNoticeShown = true;
-    void vscode.window.showInformationMessage(
-      "spacesheep mirror isn't running — `spacesheep mirror on` (CLI 1.27+) opens sessions inside VS Code.",
-    );
-  }
+  await openInBrowser(s, `openIn: ${openIn()}`);
+}
+
+function pageOptions() {
+  return {
+    mirrorUrl: '',
+    remoteSessionPath: settings().get<string>('remoteSessionPath', '/sessions/{source}/{id}'),
+    siteOrigin,
+  };
+}
+
+/**
+ * Which session Sheepfold showed in which tab. `simpleBrowser.show` opens VS Code's integrated
+ * browser where there is one (1.142: a new tab per call), else Simple Browser's one reused
+ * panel. Neither tells an extension the URL a tab shows, so the tab active right after the open
+ * is remembered; VS Code keeps one Tab object per tab for its life. A link followed inside the
+ * tab, or Simple Browser's panel reused for another page, is not seen; a tab restored by a
+ * reload is not known until its row is clicked again.
+ */
+const tabSessions = new WeakMap<vscode.Tab, Session>();
+
+function sessionInActiveTab(): Session | undefined {
+  const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+  return tab && tabSessions.get(tab);
+}
+
+/** `sheepfold.tabSession`: the active tab holds a session page Sheepfold opened. */
+function updateTabContext(): void {
+  void vscode.commands.executeCommand('setContext', 'sheepfold.tabSession', !!sessionInActiveTab());
+}
+
+/**
+ * A session's page on the spacesheep site itself, in the browser, whatever `openIn` says. The
+ * Session tab signs a message with a passkey for the site's own domain, which a page served
+ * from the mirror (`localhost`) can never use: from a tab, the page reads but cannot send
+ * (`docs/talk-from-tab-2026-10-16.md`).
+ */
+async function openInBrowser(s: Session, why = 'asked'): Promise<void> {
+  const url = fallbackSessionUrl(s, pageOptions());
+  log?.info(`open ${s.sessionId} in the browser (${why}): ${url}`);
+  await vscode.env.openExternal(vscode.Uri.parse(url));
 }
 
 async function resumeInClaudeCode(sessionId: string): Promise<void> {
@@ -387,29 +532,40 @@ async function resumeInClaudeCode(sessionId: string): Promise<void> {
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
- * After a window opens for a pending open: run the Claude Code command, retrying while that
- * extension is still starting (up to 5 tries, 1 s apart).
+ * Resume a handed-over session in this window: activate Claude Code, then run its open command,
+ * retrying while it starts (`resumeWithRetry`). Polling for the command alone never started the
+ * extension, and its own activation (`onStartupFinished` in its 2.1 manifest) can come after a
+ * new window's first seconds. An activation that never settles is waited on 10 s at most. The
+ * pending file goes only once the command ran; on failure it stays until it expires, so a reload
+ * of this window within the two minutes tries again, and the failure is said, not swallowed.
  */
-async function runWhenAvailable(sessionId: string): Promise<void> {
-  for (let i = 0; i < 5; i++) {
-    if ((await vscode.commands.getCommands(true)).includes(CLAUDE_OPEN_COMMAND)) {
-      try {
-        await vscode.commands.executeCommand(CLAUDE_OPEN_COMMAND, sessionId);
-        return;
-      } catch {
-        // not ready yet: try again
-      }
-    }
-    await sleep(1000);
+async function runPending(p: PendingOpen): Promise<void> {
+  log?.info(`pending open: resuming ${p.sessionId} in ${p.folder}`);
+  // Marked as taken, so a second window with the same folder leaves it to this one.
+  if (samePending(readPending(os.homedir()), p)) writePending(os.homedir(), { ...p, takenAt: Date.now() });
+  const ok = await resumeWithRetry({
+    activate: () => Promise.race([Promise.resolve(vscode.extensions.getExtension(CLAUDE_EXTENSION_ID)?.activate()), sleep(10_000)]),
+    registered: async () => (await vscode.commands.getCommands(true)).includes(CLAUDE_OPEN_COMMAND),
+    run: () => Promise.resolve(vscode.commands.executeCommand(CLAUDE_OPEN_COMMAND, p.sessionId)),
+    sleep,
+  });
+  if (ok) {
+    deletePendingIf(os.homedir(), p);
+    return;
   }
+  // Untaken again, so a reload of this window (or another) can try within the two minutes.
+  if (samePending(readPending(os.homedir()), p)) writePending(os.homedir(), { sessionId: p.sessionId, folder: p.folder, at: p.at });
+  const installed = vscode.extensions.getExtension(CLAUDE_EXTENSION_ID) !== undefined;
+  log?.warn(`pending open: ${p.sessionId} not resumed (Claude Code ${installed ? 'never ran its open command' : 'not found'})`);
+  const pick = await vscode.window.showWarningMessage(
+    installed
+      ? `Claude Code did not start in this window, so session ${p.sessionId.slice(0, 8)} was not resumed.`
+      : `Claude Code is not installed or not enabled in this window, so session ${p.sessionId.slice(0, 8)} was not resumed.`,
+    'Try again',
+  );
+  if (pick) await runPending(p);
 }
 
-/**
- * Runs at activation, before and independent of the first CLI refresh: on a host where the CLI
- * is missing or signed out, resuming still works. `decidePending` reads nothing but the stored
- * value and this window's folders. The value is a file in this host's home, not globalState:
- * that is per profile, and a new window can open in another profile.
- */
 /** Off by default: until the owner turns it on, a click only navigates (Claude Code for a
  * session in this workspace, spacesheep for every other) and never opens windows or writes
  * anything to another host. */
@@ -417,19 +573,48 @@ function resumeEnabled(): boolean {
   return vscode.workspace.getConfiguration('sheepfold').get<boolean>('resume', false);
 }
 
+// Pending opens this window has started, by session and moment: each is tried once on its own
+// (activation or a focus), and "Try again" is the way to repeat it.
+const tried = new Set<string>();
+
+/**
+ * Runs at activation, before and independent of the first CLI refresh: on a host where the CLI
+ * is missing or signed out, resuming still works. `decidePending` reads nothing but the stored
+ * value and this window's folders. The value is a file in this host's home, not globalState:
+ * that is per profile, and a new window can open in another profile. Runs again whenever this
+ * window gains focus: `vscode.openFolder` on a folder already open in another window focuses
+ * that window rather than opening one, and nothing activates there.
+ */
 function resumePending(): void {
   if (!resumeEnabled()) return;
   const home = os.homedir();
   const folders = (vscode.workspace.workspaceFolders ?? []).flatMap((f) => [f.uri.fsPath, f.uri.path]);
   const decision = decidePending(readPending(home), Date.now(), folders);
-  if (decision.clear) deletePending(home);
-  if (decision.run) void runWhenAvailable(decision.run.sessionId);
+  if (decision.run) {
+    const key = `${decision.run.sessionId}@${decision.run.at}`;
+    if (tried.has(key)) return;
+    tried.add(key);
+    void runPending(decision.run);
+  } else if (decision.clear) {
+    deletePending(home);
+  }
+}
+
+/** Whether `target` is one of this window's folders (no new window would open for it). */
+function openHere(target: vscode.Uri): boolean {
+  // VS Code finds a folder's window ignoring path case except for local files on Linux.
+  const ignoreCase = target.scheme !== 'file' || process.platform !== 'linux';
+  return (vscode.workspace.workspaceFolders ?? []).some((f) => sameFolder(f.uri, target, ignoreCase));
 }
 
 /**
  * Hand the session to the window that is about to open: write the pending file on the host
  * where that window's extension will run (here, or over ssh), then open the folder. If the
  * hand-over fails, say why and offer spacesheep instead of opening a window that cannot resume.
+ * The window that takes it may be a new one (it activates) or one that already had the folder
+ * open (VS Code focuses it; `resumePending` runs on focus). A folder this window has open needs
+ * no hand-over. Whichever window it is, if none took a local hand-over by the time it expires,
+ * this window removes it and says so (a remote one expires unseen: reading it costs an ssh).
  */
 async function openFolderAndResume(
   s: Session,
@@ -437,6 +622,11 @@ async function openFolderAndResume(
   folder: string,
   sshHost: string | null,
 ): Promise<void> {
+  if (openHere(target)) {
+    log?.info(`open ${s.sessionId} in a new window: ${folder} is open here, resuming here`);
+    await resumeInClaudeCode(s.sessionId);
+    return;
+  }
   const pending: PendingOpen = { sessionId: s.sessionId, folder, at: Date.now() };
   try {
     if (sshHost) await writePendingOverSsh(sshHost, pending);
@@ -451,7 +641,44 @@ async function openFolderAndResume(
     if (pick) await showOnSpacesheep(s);
     return;
   }
-  await vscode.commands.executeCommand('vscode.openFolder', target, { forceNewWindow: true });
+  try {
+    await vscode.commands.executeCommand('vscode.openFolder', target, { forceNewWindow: true });
+  } catch (e) {
+    if (!sshHost) deletePendingIf(os.homedir(), pending);
+    throw e;
+  }
+  if (!sshHost) watchPending(s, pending);
+}
+
+// Cleared when the extension stops, so no expiry check outlives it.
+const pendingWatches = new Set<NodeJS.Timeout>();
+
+/**
+ * When a local hand-over expires still in place, no window took it (Sheepfold not running
+ * there, `sheepfold.resume` off there, or Claude Code failed and that window said so):
+ * remove it and offer spacesheep here. Timed from the click, so it looks before the grace in
+ * which no other window clears an expired value; a window that took it lately and is still on
+ * it (`takenAt` within the hold) is waited for, once more, rather than told over.
+ */
+function watchPending(s: Session, p: PendingOpen, at = p.at + PENDING_MAX_AGE_MS + 1000): void {
+  const timer = setTimeout(() => {
+    pendingWatches.delete(timer);
+    const q = parsePending(readPending(os.homedir()));
+    const now = Date.now();
+    if (q && samePending(q, p) && q.takenAt !== undefined && now - q.takenAt >= 0 && now - q.takenAt < PENDING_TAKEN_HOLD_MS) {
+      watchPending(s, p, q.takenAt + PENDING_TAKEN_HOLD_MS + 1000);
+      return;
+    }
+    if (!deletePendingIf(os.homedir(), p)) return; // taken and done, or replaced by a newer click
+    log?.warn(`pending open: ${p.sessionId} for ${p.folder} expired untaken`);
+    void vscode.window
+      .showWarningMessage(
+        `No window resumed "${sessionLabel(s)}" (${p.folder}) within two minutes. The window for that folder needs Sheepfold with sheepfold.resume on, and Claude Code.`,
+        'Show on spacesheep',
+      )
+      .then((pick) => (pick ? showOnSpacesheep(s) : undefined));
+  }, Math.max(0, at - Date.now()));
+  pendingWatches.add(timer);
 }
 
 type Choice = vscode.QuickPickItem & { action: 'window' | 'spacesheep' };
@@ -467,8 +694,8 @@ async function openInNewWindow(s: Session, c: Classification): Promise<void> {
       );
       return;
     }
-    const { uri, path } = sshFolderUri(host, s.cwd);
-    await openFolderAndResume(s, vscode.Uri.parse(uri), path, host.sshHost);
+    const parts = sshFolderUri(host, s.cwd);
+    await openFolderAndResume(s, vscode.Uri.from(parts), parts.path, host.sshHost);
     return;
   }
   if (c.kind === 'here' || c.kind === 'otherFolder') {
@@ -480,11 +707,12 @@ async function openInNewWindow(s: Session, c: Classification): Promise<void> {
     await openFolderAndResume(s, vscode.Uri.file(folder), vscode.Uri.file(folder).fsPath, null);
     return;
   }
-  if (c.kind === 'noTranscript') await openSession(s, c);
+  if (c.kind === 'noTranscript' || c.kind === 'sdk') await openSession(s, c);
   else void vscode.window.showInformationMessage('This session never got a prompt — nothing to open.');
 }
 
 async function openSession(s: Session, c: Classification): Promise<void> {
+  log?.info(`click ${s.sessionId} (${s.machine ?? 'no machine'}): ${c.kind}`);
   switch (c.kind) {
     case 'here':
       await resumeInClaudeCode(s.sessionId);
@@ -508,7 +736,7 @@ async function openSession(s: Session, c: Classification): Promise<void> {
       return;
     }
     case 'remote': {
-      if (!resumeEnabled() || !remoteFor(s)) {
+      if (!resumeEnabled() || !remoteFor(s) || !offersSshResume(c)) {
         await showOnSpacesheep(s); // one option is not a choice
         return;
       }
@@ -529,6 +757,10 @@ async function openSession(s: Session, c: Classification): Promise<void> {
       );
       await showOnSpacesheep(s);
       return;
+    case 'sdk':
+      // Claude Code would open a blank session for it (see SDK_ENTRYPOINTS); its page shows it.
+      await showOnSpacesheep(s);
+      return;
     case 'empty':
       void vscode.window.showInformationMessage('This session never got a prompt — nothing to open.');
       return;
@@ -541,10 +773,20 @@ function sessionOf(arg: unknown): Session | undefined {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  readCli();
+  log = vscode.window.createOutputChannel('Sheepfold', { log: true });
+  context.subscriptions.push(log);
+  void mirrorBase(); // warm the answer the first click needs
   resumePending();
+  context.subscriptions.push(
+    vscode.window.onDidChangeWindowState((e) => {
+      if (e.focused) resumePending();
+    }),
+    { dispose: () => pendingWatches.forEach((t) => clearTimeout(t)) },
+  );
   const provider = new SessionsProvider(context.globalState);
   const view = vscode.window.createTreeView('sheepfold.sessions', { treeDataProvider: provider });
-  view.description = machineName(os.hostname());
+  view.description = thisMachine();
   const publishToggles = () =>
     void vscode.commands.executeCommand('setContext', 'sheepfold.showAllInactive', provider.showAllInactive);
   publishToggles();
@@ -572,6 +814,7 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   const publish = () => {
+    view.description = thisMachine();
     void vscode.commands.executeCommand('setContext', 'sheepfold.status', provider.status);
     const groups = provider.groupList;
     const { needsYou } = tally(groups);
@@ -657,6 +900,16 @@ export function activate(context: vscode.ExtensionContext): void {
       const s = sessionOf(arg);
       if (s) await showOnSpacesheep(s);
     }),
+    vscode.commands.registerCommand('sheepfold.openInBrowser', async (arg: unknown) => {
+      const s = sessionOf(arg);
+      if (s) await openInBrowser(s);
+    }),
+    vscode.commands.registerCommand('sheepfold.openTabInBrowser', async () => {
+      const s = sessionInActiveTab();
+      if (s) await openInBrowser(s);
+    }),
+    vscode.window.tabGroups.onDidChangeTabs(updateTabContext),
+    vscode.window.tabGroups.onDidChangeTabGroups(updateTabContext),
     vscode.commands.registerCommand('sheepfold.copySessionId', async (arg: unknown) => {
       const s = sessionOf(arg);
       if (s) await vscode.env.clipboard.writeText(s.sessionId);

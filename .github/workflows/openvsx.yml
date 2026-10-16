@@ -1,0 +1,64 @@
+# Publishes the version in package.json to Open VSX by trusted publishing: the run proves itself
+# with GitHub's OIDC token and Open VSX hands back a short-lived one, so no OVSX_PAT is stored.
+#
+# It runs only in the public twin, 220labs/sheepfold, from main. Open VSX's trusted-publisher
+# registration names this file and the `openvsx` environment (deployments from main only); any
+# ref that runs a registered file is trusted, so the environment is what keeps a
+# `claude/publish/*` branch from publishing. In the private repo both jobs are skipped.
+#
+# Two jobs, so only the publish step can mint the OIDC token: `npm ci` and the check run
+# dev-dependency code, which never gets `id-token: write`. The `.vsix` is built here, so Open VSX
+# gets CI's build of a version, not the file the owner sent to the Marketplace.
+#
+# Started by hand after the Marketplace publish (AGENTS.md, the live line), never on push: a
+# version number, once on Open VSX, cannot be published again.
+#   gh workflow run openvsx.yml --repo 220labs/sheepfold --ref main
+name: openvsx
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: openvsx
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.repository == '220labs/sheepfold' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: check and package
+        run: npm ci && npm run check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: sheepfold-*.vsix
+          if-no-files-found: error
+  publish:
+    needs: build
+    if: github.repository == '220labs/sheepfold' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: openvsx
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+      - uses: actions/setup-node@v4
+        with:
+          # ovsx 1.2.0 needs node 22 or later.
+          node-version: 22
+      - name: publish
+        # No install scripts: ovsx's dependencies arrive fresh here, beside the OIDC token
+        # (ovsx 1.2.0 ran `publish --help` without them from a fresh cache, probed on macOS
+        # 2026-10-14; the first run here is the proof on ubuntu).
+        env:
+          npm_config_ignore_scripts: 'true'
+        run: npx --yes ovsx@1.2.0 publish --trusted-publishing sheepfold-*.vsix

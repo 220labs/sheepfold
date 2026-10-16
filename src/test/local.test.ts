@@ -4,18 +4,42 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  ChildLinks,
+  FIRST_USER_MAX,
   REMOTE_WRITE_COMMAND,
   SCAN_LIMIT,
   TranscriptIndex,
   deletePending,
+  deletePendingIf,
   dirExists,
+  projectDirName,
   pendingFile,
+  readCliSettings,
   readPending,
   scanTranscript,
   writePending,
   writePendingOverSsh,
 } from '../local';
 import { decidePending } from '../model';
+
+test('readCliSettings reads only machine and appOrigin, where the CLI keeps them', () => {
+  const home = tmp();
+  assert.deepEqual(readCliSettings({}, home), { machine: null, appOrigin: null }, 'no config: the defaults');
+  const dir = path.join(home, '.config', 'spacesheep');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ key: 'ss_synthetic', machine: 'studio ', appOrigin: 'https://site.example/' }));
+  const c = readCliSettings({}, home);
+  assert.deepEqual(c, { machine: 'studio ', appOrigin: 'https://site.example' }, 'as the CLI reports it, untrimmed');
+  assert.equal(JSON.stringify(c).includes('ss_synthetic'), false, 'the key never comes out');
+  assert.equal(readCliSettings({ SPACESHEEP_APP_ORIGIN: 'https://other.example' }, home).appOrigin, 'https://other.example');
+  const xdg = tmp();
+  fs.mkdirSync(path.join(xdg, 'spacesheep'));
+  fs.writeFileSync(path.join(xdg, 'spacesheep', 'config.json'), '{"machine":"xdg"}');
+  assert.equal(readCliSettings({ XDG_CONFIG_HOME: xdg }, home).machine, 'xdg');
+  assert.equal(readCliSettings({ SPACESHEEP_CONFIG_DIR: path.join(xdg, 'spacesheep'), XDG_CONFIG_HOME: home }, home).machine, 'xdg');
+  fs.writeFileSync(path.join(dir, 'config.json'), 'not json');
+  assert.deepEqual(readCliSettings({}, home), { machine: null, appOrigin: null });
+});
 
 // Synthetic transcripts in a temp dir; nothing here is real session data.
 function tmp(): string {
@@ -42,10 +66,35 @@ test('finds a transcript under any project dir and reads the first real user mes
   ]);
   writeTranscript(cfg, '-proj-b', 'id-b', [{ type: 'assistant', message: {} }]);
   const idx = new TranscriptIndex(cfg);
-  assert.deepEqual(idx.info('id-a'), { found: true, hasUser: true, firstUser: 'Please  fix\nthe build', entrypoint: null });
+  assert.deepEqual(idx.info('id-a'), { found: true, hasUser: true, firstUser: 'Please fix the build', entrypoint: null });
   assert.deepEqual(idx.info('id-b'), { found: true, hasUser: false, firstUser: null, entrypoint: null });
   assert.deepEqual(idx.info('nope'), { found: false, hasUser: false, firstUser: null, entrypoint: null });
   assert.ok(idx.find('id-a')?.endsWith(path.join('-proj-a', 'id-a.jsonl')));
+});
+
+test('the first prompt is collapsed before the 200-character cut, so leading space costs nothing', () => {
+  const cfg = tmp();
+  writeTranscript(cfg, 'p', 'ws', [user(' '.repeat(120) + '\n'.repeat(75) + 'Fix the login bug')]);
+  assert.equal(new TranscriptIndex(cfg).info('ws').firstUser, 'Fix the login bug');
+});
+
+test('a session id with a path in it never names a file outside projects/', () => {
+  const cfg = tmp();
+  fs.writeFileSync(path.join(cfg, 'secret.jsonl'), JSON.stringify(user('SECRET')) + '\n');
+  fs.mkdirSync(path.join(cfg, 'projects'), { recursive: true });
+  assert.equal(new TranscriptIndex(cfg).info('../../secret', '/w').found, false);
+});
+
+test('a transcript of exactly SCAN_LIMIT bytes is scanned again as it grows', () => {
+  const cfg = tmp();
+  const file = writeTranscript(cfg, 'p', 'big', [{ type: 'assistant', message: {} }]);
+  const pad = SCAN_LIMIT - fs.statSync(file).size;
+  fs.appendFileSync(file, 'x'.repeat(pad - 1) + '\n');
+  assert.equal(fs.statSync(file).size, SCAN_LIMIT);
+  const idx = new TranscriptIndex(cfg);
+  assert.equal(idx.info('big').hasUser, false);
+  fs.appendFileSync(file, JSON.stringify(user('later')) + '\n');
+  assert.equal(idx.info('big').hasUser, true);
 });
 
 test('meta-only and tool-result-only transcripts', () => {
@@ -63,7 +112,7 @@ test('a missing config dir finds nothing, and does not throw', () => {
   assert.equal(idx.info('x').found, false);
 });
 
-test('the listing is cached until reset(); scans are cached per mtime', () => {
+test('the listing is cached until reset(); scans are cached per mtime and size', () => {
   const cfg = tmp();
   const idx = new TranscriptIndex(cfg);
   assert.equal(idx.find('late'), null);
@@ -71,10 +120,106 @@ test('the listing is cached until reset(); scans are cached per mtime', () => {
   assert.equal(idx.find('late'), null, 'cached listing');
   idx.reset();
   assert.equal(idx.info('late').firstUser, 'first');
-  // rewrite with a different mtime: the scan is redone
-  fs.writeFileSync(file, JSON.stringify(user('changed')) + '\n');
+  // rewritten shorter, so not an append: the scan is redone
+  fs.writeFileSync(file, JSON.stringify(user('x')) + '\n');
   fs.utimesSync(file, new Date(2030, 0, 1), new Date(2030, 0, 1));
-  assert.equal(idx.info('late').firstUser, 'changed');
+  assert.equal(idx.info('late').firstUser, 'x');
+});
+
+test('projectDirName encodes a cwd as Claude Code names its project folder', () => {
+  assert.equal(projectDirName('/home/user/projects/my_app'), '-home-user-projects-my-app');
+  assert.equal(projectDirName('/home/user/app/.claude/worktrees/x/'), '-home-user-app--claude-worktrees-x');
+  assert.equal(projectDirName('C:\\Users\\me\\app'), 'C--Users-me-app');
+});
+
+test('a session\'s own project folder is looked in first; the listing only on a miss', () => {
+  const cfg = tmp();
+  writeTranscript(cfg, '-work-app', 'direct', [user('found directly')]);
+  writeTranscript(cfg, '-elsewhere', 'moved', [user('found by listing')]);
+  const idx = new TranscriptIndex(cfg);
+  assert.equal(idx.info('direct', '/work/app').firstUser, 'found directly');
+  assert.equal(idx.stats.listings, 0, 'no project folder listed');
+  // the cwd encodes to a folder without it: one listing finds it, and it is remembered
+  assert.equal(idx.info('moved', '/work/app').firstUser, 'found by listing');
+  assert.equal(idx.stats.listings, 1);
+  idx.reset();
+  assert.equal(idx.info('moved', '/work/app').firstUser, 'found by listing');
+  assert.equal(idx.stats.listings, 1, 'the path found last time is tried before listing again');
+  // a session with no transcript here costs one listing per reset, not one per lookup
+  idx.reset();
+  assert.equal(idx.info('gone', '/work/app').found, false);
+  assert.equal(idx.info('gone2', '/work/app').found, false);
+  assert.equal(idx.stats.listings, 2);
+});
+
+test('a finished scan is kept while the transcript grows; an unfinished one is redone', () => {
+  const cfg = tmp();
+  const file = writeTranscript(cfg, '-w', 'done', [{ type: 'summary' }, user('the ask')]);
+  const open = writeTranscript(cfg, '-w', 'open', [{ type: 'summary' }]);
+  const idx = new TranscriptIndex(cfg);
+  assert.equal(idx.info('done', '/w').firstUser, 'the ask');
+  assert.equal(idx.info('open', '/w').hasUser, false);
+  assert.equal(idx.stats.scans, 2);
+  // a working session appends a turn to each
+  fs.appendFileSync(file, JSON.stringify({ type: 'assistant', message: { content: 'reply' } }) + '\n');
+  fs.appendFileSync(open, JSON.stringify(user('now an ask')) + '\n');
+  for (const f of [file, open]) fs.utimesSync(f, new Date(2030, 0, 1), new Date(2030, 0, 1));
+  assert.equal(idx.info('done', '/w').firstUser, 'the ask');
+  assert.equal(idx.stats.scans, 2, 'the finished scan is not redone');
+  assert.equal(idx.info('open', '/w').firstUser, 'now an ask');
+  assert.equal(idx.stats.scans, 3, 'the unfinished one is');
+});
+
+test('scans of transcripts not looked up since the last reset are dropped', () => {
+  const cfg = tmp();
+  writeTranscript(cfg, '-w', 'a', [user('a')]);
+  const idx = new TranscriptIndex(cfg);
+  idx.info('a', '/w');
+  idx.reset(); // looked up in this round: kept
+  idx.info('a', '/w');
+  assert.equal(idx.stats.scans, 1);
+  idx.reset();
+  idx.reset(); // a round without it: dropped
+  idx.info('a', '/w');
+  assert.equal(idx.stats.scans, 2);
+});
+
+test('the first user message is cut to FIRST_USER_MAX characters, never half a pair', () => {
+  const cfg = tmp();
+  writeTranscript(cfg, 'p', 'long', [user('w'.repeat(5000))]);
+  writeTranscript(cfg, 'p', 'pair', [user('a'.repeat(FIRST_USER_MAX - 1) + '😀 tail')]);
+  const idx = new TranscriptIndex(cfg);
+  assert.equal(idx.info('long').firstUser, 'w'.repeat(FIRST_USER_MAX));
+  assert.equal(idx.info('pair').firstUser, 'a'.repeat(FIRST_USER_MAX - 1));
+});
+
+test('ChildLinks: a half-written link is not cached, so it shows once complete', () => {
+  const dir = tmp();
+  const file = path.join(dir, 'child-1.json');
+  const when = new Date(2030, 0, 1);
+  fs.writeFileSync(file, '{"parent": "par');
+  fs.utimesSync(file, when, when);
+  const links = new ChildLinks(dir);
+  assert.deepEqual([...links.read()], []);
+  // completed within the same mtime tick: a cached failure would hide it for good
+  fs.writeFileSync(file, '{"parent": "parent-1"}');
+  fs.utimesSync(file, when, when);
+  assert.deepEqual([...links.read()], [['child-1', 'parent-1']]);
+});
+
+test('ChildLinks: a rewrite with the same mtime but another size is read again', () => {
+  const dir = tmp();
+  const file = path.join(dir, 'child-1.json');
+  const when = new Date(2030, 0, 1);
+  fs.writeFileSync(file, '{"parent": "p1"}');
+  fs.utimesSync(file, when, when);
+  const links = new ChildLinks(dir);
+  assert.equal(links.read().get('child-1'), 'p1');
+  fs.writeFileSync(file, '{"parent": "p-two"}');
+  fs.utimesSync(file, when, when);
+  assert.equal(links.read().get('child-1'), 'p-two');
+  fs.unlinkSync(file);
+  assert.equal(links.read().size, 0);
 });
 
 test('the scan stops at the limit; a big file with nothing found counts as non-empty', () => {
@@ -136,6 +281,18 @@ test('pending file: write (atomic, creates the dir), read, delete', () => {
   deletePending(home); // already gone: no throw
 });
 
+test('deletePendingIf removes only the hand-over it was given', () => {
+  const home = tmp();
+  const p = { sessionId: 'id', folder: '/work/app', at: 1_800_000_000_000 };
+  writePending(home, { ...p, at: p.at + 5 }); // a newer click replaced it
+  assert.equal(deletePendingIf(home, p), false);
+  assert.notEqual(readPending(home), undefined);
+  writePending(home, p);
+  assert.equal(deletePendingIf(home, p), true);
+  assert.equal(readPending(home), undefined);
+  assert.equal(deletePendingIf(home, p), false, 'already gone');
+});
+
 test('pending file: unreadable JSON reads as null, which decidePending clears', () => {
   const home = tmp();
   fs.mkdirSync(path.dirname(pendingFile(home)), { recursive: true });
@@ -149,7 +306,9 @@ test('pending file feeds decidePending: fires for this window, expires after two
   const at = 1_800_000_000_000;
   writePending(home, { sessionId: 'id', folder: '/work/app', at });
   assert.equal(decidePending(readPending(home), at + 1000, ['/work/app']).run?.sessionId, 'id');
-  assert.deepEqual(decidePending(readPending(home), at + 121_000, ['/work/app']), { run: null, clear: true });
+  // expired but kept a moment, so the clicking window can still see no window took it
+  assert.deepEqual(decidePending(readPending(home), at + 121_000, ['/work/app']), { run: null, clear: false });
+  assert.deepEqual(decidePending(readPending(home), at + 126_000, ['/work/app']), { run: null, clear: true });
 });
 
 // A stand-in `ssh`: runs its last argument (the remote command) in a shell with HOME set to a
