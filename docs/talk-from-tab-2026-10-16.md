@@ -1,7 +1,8 @@
 # Messages to a session from a VS Code tab — a proposal to spacesheep, 2026-10-16
 
-Status: proposal, to be sent to spacesheep once public; Sheepfold's stopgap built (0.6.0, "Open
-in Browser").
+Status: proposal, public 2026-10-16, revised the same day for VS Code 1.142's integrated browser
+(section "VS Code 1.142"), sent as spacesheep-dev/spacesheep-cli issue 53; Sheepfold's stopgap
+built (0.6.0, "Open in Browser").
 
 Sheepfold opens a session's spacesheep page in a VS Code tab through the CLI's mirror
 (`spacesheep mirror`, `docs/inline-view-2026-10-11.md`). The page reads fine there, but its
@@ -38,31 +39,34 @@ Not observed: a Send pressed in a tab. The two refusals are read from the page's
 mirror (`lib/mirror.js`, CLI 1.30.0) and the daemon (sessionpipe 0.5.0's `cli.js`), plus the live
 `/api/machines` answer through the mirror.
 
-## Proposal: approve the tab's key from the browser
+## Proposal: approve the tab's key on another device, by code
 
 The grant already separates the passkey from the key that signs. The key can be made anywhere;
-only the assertion over the grant has to happen on spacesheep.dev. So:
+only the assertion over the grant has to happen where the passkey is: spacesheep.dev in a real
+browser, on this computer or a phone. So, in the shape of a device-code sign-in:
 
-1. In the mirrored page, when the Session tab needs a grant and `location.hostname` is not the
-   `rp_id`, it makes its key pair as it does now (non-extractable, in its own IndexedDB) and
-   builds the grant string with `rp: rp_id`.
+1. When the Session tab needs a grant and the passkey cannot be used where the page is — the
+   page is not on the `rp_id` (the mirror), or the person picks "Approve on another device"
+   (an embedded browser such as VS Code's, where no passkey is reachable; section "VS Code
+   1.142") — the page makes its key pair as it does now (non-extractable, in its own IndexedDB)
+   and builds the grant string with `rp: rp_id`.
 2. It asks the server for an approval: `POST /api/grants/pending { grant }` (through the
-   mirror, so on the CLI's own signed-in session) and gets back `{ code }`, short-lived (five
-   minutes) and one-use.
-3. It shows "Approve this tab in your browser", the code, and a button that opens
-   `https://${rp_id}/approve/${code}` in a new window. The page builds that URL itself, at run
-   time: the mirror rewrites every `//spacesheep.dev` it finds in a page, script or JSON answer
-   to its own `localhost` address, so a URL the server sent, or one written out in the script,
-   would open the approve page on `localhost`, where the passkey cannot be used. (The bare
-   `rp_id` survives the mirror for the same reason: no `//` in front.) In VS Code the new
-   window should be the system browser; untested, and Sheepfold's "Open in Browser" (below) is
-   the fallback.
-4. The approve page, signed in as the same account, shows what it approves — the machine(s),
-   "a VS Code tab", the code to compare, the expiry — and on a click runs the passkey assertion
-   over the grant's hash, exactly as the Session tab does today. It posts the assertion to
-   `POST /api/grants/pending/<code>`.
-5. The mirrored page polls `GET /api/grants/pending/<code>` and, once the assertion is there,
-   holds a grant it uses like any other until it expires.
+   mirror, on the CLI's own signed-in session; or on the embedded browser's own) and gets back
+   `{ code }`, short (eight characters), five minutes, one use.
+3. It shows the code, "Approve at spacesheep.dev/approve", and a QR code of
+   `https://${rp_id}/approve?code=${code}`. The page builds that URL itself, at run time: the
+   mirror rewrites every `//spacesheep.dev` it finds in a page, script or JSON answer to its own
+   `localhost` address, so a URL the server sent, or one written out in the script, would point
+   at `localhost`, where the passkey cannot be used. (The bare `rp_id` survives the mirror for
+   the same reason: no `//` in front.) No button that opens a window: in VS Code 1.142 a new
+   window from the page opens as another VS Code browser tab, where the passkey is not
+   reachable either; Sheepfold's "Open in Browser" (below) or the phone's camera is the way out.
+4. The approve page, signed in as the same account, takes the code (typed, or filled from the
+   QR), shows what it approves — the machine(s), "a browser tab", the expiry — and on a click
+   runs the passkey assertion over the grant's hash, exactly as the Session tab does today. It
+   posts the assertion to `POST /api/grants/pending/<code>`.
+5. The page polls `GET /api/grants/pending/<code>` and, once the assertion is there, holds a
+   grant it uses like any other until it expires.
 
 Why this and not the alternatives:
 
@@ -75,13 +79,14 @@ Why this and not the alternatives:
 
 Guards the approve flow needs:
 
-- **The code comparison is the guard.** The mirror lends the account's session to whatever
-  reaches it, so anything that can call the mirror could file a pending approval for a key of
-  its own and open its approve page, and the owner's touch would grant that key. What stops it
-  is the owner checking that the code on the approve page is the one the tab shows. The approve
-  page puts the code first and acts only on a click (a passkey prompt that appears unasked is
+- **The code is the guard.** The mirror lends the account's session to whatever reaches it,
+  so anything that can call the mirror could file a pending approval for a key of its own, and
+  the owner's touch on that code would grant that key. What stops it is that the owner brings
+  the code from the tab they are looking at, typed or scanned, so the approve page never offers
+  a code nobody asked for, and acts only on a click (a passkey prompt that appears unasked is
   easy to approve by reflex). A grant someone else collects is useless without the private key
-  it names, so approving the right code is enough.
+  it names, so approving the right code is enough. This is the device-code pattern (RFC 8628)
+  with a passkey at the end.
 - The pending approval belongs to the account that created it: another account cannot read or
   complete it.
 - This leans on the mirror answering only its own pages; the mirror findings sent privately on
@@ -92,21 +97,41 @@ Rejected:
 - **The mirror signs for the tab**, with a local key enrolled through the daemon's `key.add`:
   needs a non-passkey key type in sessionpipe, and makes every local process that can reach the
   mirror able to message every session.
+- **spacesheep.dev straight in VS Code's integrated browser**, no mirror: the origin is right,
+  but no passkey is reachable there (section "VS Code 1.142"), so it fails at the same step.
 - **A passkey for `localhost`**: a second passkey per machine, a daemon change to accept a
   second `rpId`, and inside Simple Browser's frame (which sets no `publickey-credentials-get`
   permission) the daemon would refuse the assertion as `crossOrigin` anyway.
 
-## Open: VS Code's integrated browser (1.142)
+## VS Code 1.142: the integrated browser reaches no passkey
 
 The mirror exists because spacesheep.dev refuses to be framed, and Simple Browser is a frame.
 VS Code 1.142 sends `simpleBrowser.show` to its own integrated browser instead
-(`workbench.action.browser.open`, an editor of its own with persistent storage), which looks
-like a top-level browser view rather than a frame. If it is, spacesheep.dev may load in it
-directly, signed in once, and its passkey may work there with no mirror and no change on
-spacesheep's side — for VS Code 1.142 and later. Untested: loading the page, signing in
-(Google may refuse an embedded browser), and WebAuthn inside Electron. Until that is tried, this
-proposal stands for the mirror, which every other editor (older VS Code, Cursor, VSCodium) still
-needs.
+(`workbench.action.browser.open`). Read from VS Code 1.142.0's main process (`mainImpl.js`),
+its Electron 43.7.7 and its code signature:
+
+- **It is a top-level view, not a frame**: an Electron `WebContentsView` in the window, with its
+  own persistent storage (`persist:vscode-browser`, or a per-workspace folder). spacesheep.dev
+  could load in it directly; the frame refusal no longer applies.
+- **It reaches no passkey on macOS.** Passkeys in iCloud Keychain or a password manager reach
+  an app only with Apple's managed entitlement
+  `com.apple.developer.web-browser.public-key-credential`; VS Code is signed with four
+  entitlements (Apple events, JIT, microphone, camera) and not that one. Electron 43 can offer
+  Touch ID passkeys (`app.configureWebAuthn({ touchID })`, which needs a `keychain-access-groups`
+  entitlement too), but VS Code never calls it, and that path reaches only passkeys made inside
+  the app. So a passkey enrolled from a browser cannot sign on spacesheep.dev inside VS Code
+  either, whatever the origin. Not tried: a USB security key, and a phone over Bluetooth
+  (Chrome's QR-code prompt belongs to Chrome, not to Electron, so unlikely).
+- **A new window opens inside VS Code.** The view's `setWindowOpenHandler` turns `window.open`
+  and `target="_blank"` into another integrated-browser tab (when its popup permission allows),
+  not the system browser, so the page cannot hand off to a real browser by itself.
+
+What follows: the fix is needed for VS Code 1.142 as much as for the mirror, and its last step
+has to happen on another device or browser, which is why step 3 shows a code and a QR rather
+than a button. The mirror still earns its place in VS Code: it signs the page in with the CLI's
+key, where the integrated browser's own storage would need a sign-in of its own (and Google may
+refuse an embedded browser; not tried). Other editors (older VS Code, Cursor, VSCodium) keep
+Simple Browser's frame and need the mirror for the page to load at all.
 
 ## The stopgap in Sheepfold (0.6.0)
 
@@ -128,3 +153,6 @@ else changes: a click still opens the tab.
   under `docs/` on the allowlist, and is then to be sent as an issue on
   `spacesheep-dev/spacesheep-cli`, the public repo nearest the page (the mirror lives there; the
   site's code is not public), linking this file.
+- The owner (2026-10-16): re-analyse the proposal on VS Code 1.142. Done above: the browser hand-off
+  became a device code, and the open question about the integrated browser is answered from VS
+  Code's own code rather than left for a hand test.
