@@ -24,9 +24,11 @@ concurrency:
 jobs:
   build:
     if: github.repository == '220labs/sheepfold' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","macOS"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
+      - name: a scratch HOME, so the host user's own stays untouched
+        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -41,13 +43,15 @@ jobs:
   publish:
     needs: build
     if: github.repository == '220labs/sheepfold' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","macOS"]') || 'ubuntu-latest' }}
     environment: openvsx
     timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
     steps:
+      - name: a scratch HOME, so the host user's own stays untouched
+        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: vsix
