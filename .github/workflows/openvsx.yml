@@ -27,7 +27,7 @@ jobs:
     runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","macOS"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
-      - name: a scratch global git config, so the host user's identity stays untouched (HOME stays real: macOS Chrome and the user site need it)
+      - name: a scratch global git config, so the host user's identity stays untouched (HOME stays real, for macOS Chrome and the user site)
         run: echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -50,7 +50,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: a scratch global git config, so the host user's identity stays untouched (HOME stays real: macOS Chrome and the user site need it)
+      - name: a scratch global git config, so the host user's identity stays untouched (HOME stays real, for macOS Chrome and the user site)
         run: echo "GIT_CONFIG_GLOBAL=$RUNNER_TEMP/gitconfig" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
