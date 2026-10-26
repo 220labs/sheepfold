@@ -16,6 +16,9 @@ with `sheepfold.resume` (section "Resuming elsewhere").
 
 ## Requirements
 
+- **A spacesheep Pro plan or above** ($4.50 a month; Max and Team include it). Sheepfold lists
+  the sessions spacesheep's session hooks report, and the free plan has no session hooks: on it
+  the sidebar stays empty. Plans: <https://spacesheep.dev/plans>.
 - The `spacesheep` CLI (1.26 or later), signed in, with session reporting on. Sheepfold runs
   `spacesheep sessions list`; it holds no credentials of its own.
 - The [Claude Code extension](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code)

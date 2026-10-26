@@ -24,7 +24,9 @@ concurrency:
 jobs:
   build:
     if: github.repository == '220labs/sheepfold' && github.ref == 'refs/heads/main'
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","macOS"]') || 'ubuntu-latest' }}
+    # Hosted, as a literal: these jobs run only in the public twin, and the publish job holds an
+    # OIDC token, so no inherited CI_RUNS_ON variable may route it to a self-hosted runner.
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: a scratch global git config, so the host user's identity stays untouched (HOME stays real, for macOS Chrome and the user site)
@@ -43,7 +45,7 @@ jobs:
   publish:
     needs: build
     if: github.repository == '220labs/sheepfold' && github.ref == 'refs/heads/main'
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","macOS"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     environment: openvsx
     timeout-minutes: 10
     permissions:

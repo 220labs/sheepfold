@@ -1,7 +1,7 @@
 {
   "name": "sheepfold",
   "displayName": "sheepfold",
-  "description": "Your coding-agent sessions from spacesheep, in a VS Code sidebar, the ones that need you first.",
+  "description": "Your coding-agent sessions from spacesheep, in a VS Code sidebar, the ones that need you first. Needs spacesheep Pro.",
   "version": "0.6.0",
   "publisher": "220labs",
   "license": "MIT",
